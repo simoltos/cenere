@@ -31,6 +31,10 @@ A nonzero status stops the operation.
 | `keyboard` | Live environment; executable from the source image. | After system keyboard selection, before password entry. |
 | `configure` | Inside the installed root. | After account creation, before initramfs generation, GRUB setup, and removal of live-only packages. |
 
+The terminal wizard keeps the layout, variant, and optional typing test on one page.
+Confirming the selection applies it before enabling the test field; Enter can skip typing.
+Confirming a different mapping runs `keyboard` again and clears previously entered passwords.
+
 ## Configure the distribution
 
 For a graphical image, apply the selected mapping in these locations:
@@ -60,7 +64,7 @@ Run `cenere` as root in a terminal in the prepared live environment.
 
 For both plain and encrypted installations, do these checks:
 
-1. Before password entry, make sure the selected keyboard mapping is active.
+1. Before password entry, make sure the selected keyboard mapping is active, including when the optional typing test is skipped.
 2. Complete the installation.
 3. Boot the installed disk without the installation medium.
 4. For an encrypted installation, do a keyboard test at disk unlock.

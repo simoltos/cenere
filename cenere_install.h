@@ -15,7 +15,6 @@ struct installation_plan {
     char keymap[64], locale[64], timezone[96], keymap_group[32];
     char xkb_layout[64], xkb_model[64], xkb_variant[64], xkb_options[128];
     char image_id[64], live_user[32];
-    size_t keymap_variant_count;
     char hostname[64], username[32], password[256], existing_password[256];
     char firmware[8], bootloader[16];
     bool existing_os, alongside;

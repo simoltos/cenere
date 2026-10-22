@@ -604,7 +604,7 @@ static bool ask_secret(char *stored, size_t size, const char *label, const char 
 }
 
 enum ui_page {
-    UI_KEYMAP, UI_KEYMAP_VARIANT, UI_KEYBOARD_TEST,
+    UI_KEYMAP,
     UI_DESTINATION, UI_UNLOCK, UI_UNLOCK_PASSWORD, UI_OTHER_SYSTEMS,
     UI_PRESERVE_HOME, UI_ENCRYPTION,
     UI_LOCALE, UI_TIMEZONE, UI_HOSTNAME, UI_USERNAME,
@@ -1207,19 +1207,17 @@ static bool ui_page_visible(enum ui_page page, enum execution_mode mode)
         return mode == REAL_INSTALLATION && ui_active_plan->existing_os && !ui_active_plan->discard_encrypted;
     if (page == UI_PRESERVE_HOME)
         return ui_active_plan->existing_home && !ui_active_plan->discard_encrypted;
-    if (page == UI_KEYMAP_VARIANT)
-        return ui_active_plan->keymap_variant_count > 1;
     return true;
 }
 
 static void ui_header(const char *title, enum ui_page page, enum execution_mode mode, bool cursor)
 {
-    const char *section = page <= UI_KEYBOARD_TEST ? "Keyboard preparation"
+    const char *section = page == UI_KEYMAP ? "Keyboard preparation"
                         : page <= UI_ENCRYPTION ? "Disk preparation"
                         : page <= UI_TIMEZONE ? "1 of 4: Preferences"
                         : page < UI_REVIEW ? "2 of 4: Account"
                         : page == UI_REVIEW ? "3 of 4: Summary" : "4 of 4: Install";
-    unsigned active=page<=UI_KEYBOARD_TEST ? 0 : page<=UI_ENCRYPTION ? 1 :
+    unsigned active=page==UI_KEYMAP ? 0 : page<=UI_ENCRYPTION ? 1 :
                     page<=UI_TIMEZONE ? 2 : page<UI_REVIEW ? 3 : page==UI_REVIEW ? 4 : 5;
     const char *phases[]={"Keyboard","Disk","Preferences","Account","Summary","Install"};
     char heading[128],path[128]="";
@@ -1482,51 +1480,246 @@ static const char *ui_keymap_group_label(const char *group)
     return group;
 }
 
-static enum ui_result ui_keymap_group_menu(struct installation_plan *plan, enum execution_mode mode)
+struct ui_keyboard_list {
+    struct ui_catalog catalog;
+    char search[80];
+    size_t selected, matches[256], count, position;
+};
+
+static void ui_keyboard_filter(struct ui_keyboard_list *list)
 {
-    struct cenere_keyboard maps[256];
-    size_t count=cenere_keyboards(maps,256,mode==DEMO_INSTALLATION);
-    struct ui_catalog groups={0};
-    for (size_t i=0;i<count;i++) {
-        char group[64]; snprintf(group,sizeof(group),"%.*s",(int)strcspn(maps[i].layout,","),maps[i].layout);
-        ui_catalog_add(&groups,maps[i].name,group);
+    list->count = 0;
+    list->position = 0;
+    for (size_t i = 0; i < list->catalog.count; i++) {
+        if (!strcasestr(list->catalog.options[i].label, list->search) &&
+            !strcasestr(list->catalog.options[i].value, list->search))
+            continue;
+        if (i == list->selected)
+            list->position = list->count;
+        list->matches[list->count++] = i;
     }
-    qsort(groups.options,groups.count,sizeof(*groups.options),ui_compare_options);
-    char choice[sizeof(plan->keymap_group)]; strcpy(choice,plan->keymap_group);
-    enum ui_result result=ui_menu("Choose the keyboard layout",groups.options,groups.count,
-                                 choice,sizeof(choice),UI_KEYMAP,mode);
-    if (result==UI_NEXT) {
-        size_t first=count,variants=0; bool current=false;
-        for (size_t i=0;i<count;i++) if (strlen(choice)==strcspn(maps[i].layout,",") &&
-                                       !strncmp(choice,maps[i].layout,strlen(choice))) {
-            variants++;
-            if (first==count || !strcmp(maps[i].keymap,choice)) first=i;
-            if (!strcmp(maps[i].keymap,plan->keymap)) current=true;
-        }
-        if (first==count || !cenere_select_keyboard(plan,current?plan->keymap:maps[first].keymap,
-                                                    mode==DEMO_INSTALLATION)) result=UI_CANCEL;
-        plan->keymap_variant_count=variants;
-    }
-    ui_catalog_free(&groups);
-    return result;
+    if (list->count)
+        list->selected = list->matches[list->position];
 }
 
-static enum ui_result ui_keymap_variant_menu(struct installation_plan *plan, enum execution_mode mode)
+static size_t ui_keyboard_input(size_t row, size_t column, size_t width, const char *value,
+                                const char *placeholder, bool focused)
+{
+    size_t visible = width > 2 ? width - 2 : 0;
+    size_t length = strlen(value), start = length > visible ? length - visible : 0;
+    const char *text = length ? value + start : placeholder;
+    printf("\033[%zu;%zuH%s %-*.*s %s", row, column, focused ? "\033[7m" : "\033[2m",
+           (int)visible, (int)visible, text, "\033[0m");
+    return column + 1 + length - start;
+}
+
+static size_t ui_keyboard_draw_list(const struct ui_keyboard_list *list, const char *title,
+                                    size_t column, size_t width, size_t rows, bool focused)
+{
+    printf("\033[6;%zuH%c %.*s", column, focused ? '>' : ' ', (int)width - 2, title);
+    size_t cursor = ui_keyboard_input(7, column, width, list->search, "Type to filter...", focused);
+    if (!list->count)
+        printf("\033[9;%zuH%.*s", column, (int)width, "No matching choices.");
+    else {
+        size_t first = list->position >= rows ? list->position - rows + 1 : 0;
+        for (size_t i = first; i < list->count && i < first + rows; i++) {
+            bool selected = i == list->position;
+            printf("\033[%zu;%zuH%s%c %-*.*s\033[0m", 9 + i - first, column,
+                   selected && focused ? "\033[7m" : "", selected ? '>' : ' ',
+                   (int)width - 2, (int)width - 2, list->catalog.options[list->matches[i]].label);
+        }
+        if (list->count > rows)
+            printf("\033[%zu;%zuH%zu / %zu", 9 + rows, column, list->position + 1, list->count);
+    }
+    return cursor;
+}
+
+static void ui_keyboard_edit(char *value, size_t size, int key)
+{
+    size_t length = strlen(value);
+    if ((key == 127 || key == 8) && length) {
+        do {
+            length--;
+        } while (length && ((unsigned char)value[length] & 0xc0) == 0x80);
+        value[length] = '\0';
+    } else if (key == 21)
+        explicit_bzero(value, size);
+    else if (key >= 32 && key <= 255 && key != 127 && length + 1 < size) {
+        value[length] = (char)key;
+        value[length + 1] = '\0';
+    }
+}
+
+static void ui_keyboard_list_key(struct ui_keyboard_list *list, int key, size_t rows)
+{
+    if (key == UI_KEY_UP || key == UI_KEY_PAGE_UP || key == UI_KEY_HOME) {
+        size_t step = key == UI_KEY_UP ? 1 : rows;
+        if (list->count)
+            list->selected = list->matches[key == UI_KEY_HOME || list->position < step
+                                               ? 0 : list->position - step];
+    } else if (key == UI_KEY_DOWN || key == UI_KEY_PAGE_DOWN || key == UI_KEY_END) {
+        size_t next = list->position + (key == UI_KEY_DOWN ? 1 : rows);
+        if (list->count)
+            list->selected = list->matches[key == UI_KEY_END || next >= list->count
+                                               ? list->count - 1 : next];
+    } else
+        ui_keyboard_edit(list->search, sizeof(list->search), key);
+}
+
+static bool ui_keyboard_variants(struct ui_keyboard_list *variants,
+                                 const struct cenere_keyboard *maps, size_t count,
+                                 const char *group, const char *keymap)
+{
+    ui_catalog_free(&variants->catalog);
+    *variants = (struct ui_keyboard_list){0};
+    const char *preferred = NULL;
+    for (size_t i = 0; i < count; i++) {
+        if (strlen(group) != strcspn(maps[i].layout, ",") ||
+            strncmp(group, maps[i].layout, strlen(group)))
+            continue;
+        char label[256];
+        snprintf(label, sizeof(label), "%.159s (%.63s)", maps[i].variant_name, maps[i].keymap);
+        ui_catalog_add(&variants->catalog, label, maps[i].keymap);
+        if (!preferred || !strcmp(maps[i].keymap, group))
+            preferred = maps[i].keymap;
+    }
+    if (variants->catalog.failed || !variants->catalog.count)
+        return false;
+    qsort(variants->catalog.options, variants->catalog.count,
+          sizeof(*variants->catalog.options), ui_compare_options);
+    for (size_t i = 0; i < variants->catalog.count; i++)
+        if (!strcmp(variants->catalog.options[i].value, preferred))
+            variants->selected = i;
+    for (size_t i = 0; i < variants->catalog.count; i++)
+        if (!strcmp(variants->catalog.options[i].value, keymap))
+            variants->selected = i;
+    return true;
+}
+
+static enum ui_result ui_keyboard_page(struct installation_plan *plan, enum execution_mode mode,
+                                       char *applied_keymap, size_t applied_size)
 {
     struct cenere_keyboard maps[256];
-    size_t count=cenere_keyboards(maps,256,mode==DEMO_INSTALLATION);
-    struct ui_catalog variants={0};
-    for (size_t i=0;i<count;i++) if (strlen(plan->keymap_group)==strcspn(maps[i].layout,",") &&
-                                   !strncmp(plan->keymap_group,maps[i].layout,strlen(plan->keymap_group))) {
-        char label[256];
-        snprintf(label,sizeof(label),"%.159s (%.63s)",maps[i].variant_name,maps[i].keymap);
-        ui_catalog_add(&variants,label,maps[i].keymap);
+    size_t count = cenere_keyboards(maps, UI_OPTIONS(maps), mode == DEMO_INSTALLATION);
+    struct ui_keyboard_list layouts = {0}, variants = {0};
+    enum { KEYBOARD_LAYOUT, KEYBOARD_VARIANT, KEYBOARD_TEST } focus = KEYBOARD_LAYOUT;
+    enum ui_result result = UI_CANCEL;
+    char group[64] = "", test[128] = "";
+
+    for (size_t i = 0; i < count; i++) {
+        char code[64];
+        snprintf(code, sizeof(code), "%.*s", (int)strcspn(maps[i].layout, ","), maps[i].layout);
+        ui_catalog_add(&layouts.catalog, maps[i].name, code);
     }
-    qsort(variants.options,variants.count,sizeof(*variants.options),ui_compare_options);
-    enum ui_result result=ui_menu("Choose a keyboard variant",variants.options,variants.count,
-                                 plan->keymap,sizeof(plan->keymap),UI_KEYMAP_VARIANT,mode);
-    if (result==UI_NEXT && !cenere_select_keyboard(plan,plan->keymap,mode==DEMO_INSTALLATION)) result=UI_CANCEL;
-    ui_catalog_free(&variants);
+    if (layouts.catalog.failed || !layouts.catalog.count)
+        goto done;
+    qsort(layouts.catalog.options, layouts.catalog.count, sizeof(*layouts.catalog.options), ui_compare_options);
+    for (size_t i = 0; i < layouts.catalog.count; i++)
+        if (!strcmp(layouts.catalog.options[i].value, plan->keymap_group))
+            layouts.selected = i;
+
+    for (;;) {
+        ui_keyboard_filter(&layouts);
+        const char *selected_group = layouts.catalog.options[layouts.selected].value;
+        if (strcmp(group, selected_group)) {
+            snprintf(group, sizeof(group), "%s", selected_group);
+            if (!ui_keyboard_variants(&variants, maps, count, group, plan->keymap))
+                break;
+        }
+        ui_keyboard_filter(&variants);
+        size_t lines = ui_lines(), width = ui_panel_width(), left = ui_panel_left();
+        bool fits = ui_columns() >= 60 && lines >= 18;
+        ui_header("Choose the keyboard layout", UI_KEYMAP, mode, fits);
+        if (!fits) {
+            ui_row(6, "Resize to at least 60 columns and 18 rows.");
+            fflush(stdout);
+            int key = ui_key();
+            if (key == 3 || key == UI_KEY_EOF)
+                break;
+            if (key == 27) {
+                result = UI_BACK;
+                break;
+            }
+            continue;
+        }
+        size_t rows = lines - 16, column_width = (width - 4) / 2;
+        size_t layout_cursor = ui_keyboard_draw_list(&layouts, "Layout", left, column_width,
+                                                     rows, focus == KEYBOARD_LAYOUT);
+        size_t variant_cursor = ui_keyboard_draw_list(&variants, "Variant", left + column_width + 4,
+                                                      column_width, rows, focus == KEYBOARD_VARIANT);
+        ui_row(lines - 6, focus == KEYBOARD_TEST ? "> Test the keyboard (optional)"
+                                                : "  Test the keyboard (optional)");
+        size_t test_cursor = ui_keyboard_input(lines - 5, left, width, test,
+                                               *applied_keymap ? "Type here, or press Enter to continue."
+                                                               : "Confirm a layout to try it.",
+                                               focus == KEYBOARD_TEST);
+        char active[416] = "Confirm the selection to activate the layout.";
+        for (size_t i = 0; i < count; i++)
+            if (!strcmp(maps[i].keymap, applied_keymap))
+                snprintf(active, sizeof(active), "Active: %.159s - %.159s (%.63s)",
+                         maps[i].name, maps[i].variant_name, maps[i].keymap);
+        ui_row(lines - 3, active);
+        ui_center(lines - 2, focus == KEYBOARD_TEST
+                                ? "Enter: continue   Tab: layout   Esc: edit"
+                                : "Enter: select   Tab: next field   Esc: back");
+        printf("\033[%zu;%zuH", focus == KEYBOARD_TEST ? lines - 5 : 7,
+               focus == KEYBOARD_LAYOUT ? layout_cursor
+               : focus == KEYBOARD_VARIANT ? variant_cursor : test_cursor);
+        fflush(stdout);
+        int key = ui_key();
+        if (key == 3 || key == UI_KEY_EOF)
+            break;
+        if (key == 27 || key == UI_KEY_LEFT) {
+            if (focus == KEYBOARD_LAYOUT) {
+                result = UI_BACK;
+                break;
+            }
+            focus = focus == KEYBOARD_TEST && variants.catalog.count > 1
+                        ? KEYBOARD_VARIANT : KEYBOARD_LAYOUT;
+        } else if (key == '\r' || key == '\n' || key == '\t') {
+            if (focus == KEYBOARD_TEST) {
+                if (key == '\t')
+                    focus = KEYBOARD_LAYOUT;
+                else {
+                    result = UI_NEXT;
+                    break;
+                }
+                continue;
+            }
+            if (!layouts.count)
+                continue;
+            if (focus == KEYBOARD_LAYOUT && variants.catalog.count > 1) {
+                focus = KEYBOARD_VARIANT;
+                continue;
+            }
+            if (!variants.count)
+                continue;
+            const char *keymap = variants.catalog.options[variants.selected].value;
+            if (!cenere_select_keyboard(plan, keymap, mode == DEMO_INSTALLATION) ||
+                (strcmp(applied_keymap, keymap) && mode == REAL_INSTALLATION &&
+                 !cenere_apply_keyboard(plan))) {
+                ui_end();
+                fprintf(stderr, "%s\n", cenere_error());
+                break;
+            }
+            if (strcmp(applied_keymap, plan->keymap)) {
+                explicit_bzero(test, sizeof(test));
+                if (*applied_keymap) {
+                    explicit_bzero(plan->password, sizeof(plan->password));
+                    explicit_bzero(plan->existing_password, sizeof(plan->existing_password));
+                }
+                snprintf(applied_keymap, applied_size, "%s", plan->keymap);
+            }
+            focus = KEYBOARD_TEST;
+        } else if (focus == KEYBOARD_TEST)
+            ui_keyboard_edit(test, sizeof(test), key);
+        else
+            ui_keyboard_list_key(focus == KEYBOARD_LAYOUT ? &layouts : &variants, key, rows);
+    }
+done:
+    explicit_bzero(test, sizeof(test));
+    ui_catalog_free(&layouts.catalog);
+    ui_catalog_free(&variants.catalog);
     return result;
 }
 
@@ -1696,22 +1889,9 @@ static bool ui_wizard(struct installation_plan *plan, enum execution_mode mode)
     for (;;) {
         enum ui_result result = UI_CANCEL;
         switch (page) {
-        case UI_KEYBOARD_TEST: {
-            if (strcmp(applied_keymap,plan->keymap)) {
-                if (mode==REAL_INSTALLATION && !cenere_apply_keyboard(plan)) {
-                    ui_end(); fprintf(stderr,"%s\n",cenere_error()); result=UI_CANCEL; break;
-                }
-                if (*applied_keymap) {
-                    explicit_bzero(plan->password,sizeof(plan->password));
-                    explicit_bzero(plan->existing_password,sizeof(plan->existing_password));
-                }
-                snprintf(applied_keymap,sizeof(applied_keymap),"%s",plan->keymap);
-            }
-            char test[128]="";
-            result=ui_text("Test the keyboard: type a few characters",test,sizeof(test),false,false,
-                           NULL,page,mode,NULL);
+        case UI_KEYMAP:
+            result = ui_keyboard_page(plan, mode, applied_keymap, sizeof(applied_keymap));
             break;
-        }
         case UI_UNLOCK: {
             static const struct ui_option choices[]={
                 {"Unlock and inspect before choosing what to preserve","unlock"},
@@ -1761,12 +1941,6 @@ static bool ui_wizard(struct installation_plan *plan, enum execution_mode mode)
             break;
         case UI_ENCRYPTION:
             result = ui_encryption(plan, mode);
-            break;
-        case UI_KEYMAP:
-            result = ui_keymap_group_menu(plan, mode);
-            break;
-        case UI_KEYMAP_VARIANT:
-            result = ui_keymap_variant_menu(plan, mode);
             break;
         case UI_LOCALE:
             result = ui_catalog_menu("Choose the language and locale", plan->locale,

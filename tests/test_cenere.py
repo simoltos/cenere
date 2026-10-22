@@ -7,6 +7,7 @@ Only the sandbox has root privileges; no host mount or disk is modified.
 """
 
 import argparse
+import fcntl
 import os
 from pathlib import Path
 import select
@@ -14,6 +15,7 @@ import shlex
 import shutil
 import signal
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -294,8 +296,8 @@ class TerminalWizardTests(unittest.TestCase):
         os.write(self.master,b"\r");self.wait_for(expected)
 
     def prepare_keyboard(self):
-        self.enter(b"Test the keyboard")
-        os.write(self.master,b"test-layout\r");self.wait_for(b"Choose the destination disk")
+        self.enter(b"Enter: continue   Tab: layout")
+        self.enter(b"Choose the destination disk")
 
     def reach_password(self):
         self.prepare_keyboard()
@@ -336,12 +338,12 @@ class TerminalWizardTests(unittest.TestCase):
         self.assertEqual(termios.tcgetattr(self.slave),self.original_settings)
 
     def test_named_variants_back_navigation_and_disk_without_home(self):
-        os.write(self.master,b"italian\r");self.wait_for(b"Choose a keyboard variant")
+        os.write(self.master,b"italian\r");self.wait_for(b"> Variant")
         self.wait_for(b"Italian (US keyboard)")
         os.write(self.master,b"\x1b");self.wait_for(b"Choose the keyboard layout")
-        self.wait_for(b"\x1b[7mItalian")
-        self.enter(b"Choose a keyboard variant")
-        self.enter(b"Test the keyboard")
+        self.wait_for(b"\x1b[7m> Italian")
+        self.enter(b"> Variant")
+        self.enter(b"Enter: continue   Tab: layout")
         os.write(self.master,b"keyboard test\r");self.wait_for(b"Choose the destination disk")
         os.write(self.master,b"\x1b[B\r");self.wait_for(b"Encrypt the system and home?")
         self.assertNotIn(b"Keep the existing home files?",self.transcript)
@@ -350,6 +352,102 @@ class TerminalWizardTests(unittest.TestCase):
         self.finish(b"selected layout secret")
         self.assertIn(b"Demo disk B",self.transcript)
         self.assertNotIn(b"Variant (",self.transcript)
+
+    def test_keyboard_trial_is_visible_from_the_start_and_optional_on_the_same_page(self):
+        self.wait_for(b"Enter: select   Tab: next field")
+        self.assertIn(b"Test the keyboard (optional)", self.transcript)
+        self.assertIn(b"Confirm a layout to try it.", self.transcript)
+        self.enter(b"Enter: continue   Tab: layout")
+        screen = self.transcript.rsplit(b"\x1b[2J", 1)[-1]
+        for label in (b"Choose the keyboard layout", b"Layout", b"Variant",
+                      b"> Test the keyboard (optional)", b"Active: English (US) - Default (us)"):
+            self.assertIn(label, screen)
+        self.assertNotIn(b"Choose the destination disk", self.transcript)
+        self.enter(b"Choose the destination disk")
+        self.assertNotIn(b"Enter a valid value", self.transcript)
+
+    def test_variant_filter_and_trial_text_do_not_change_the_layout_search(self):
+        os.write(self.master, b"italian\r")
+        self.wait_for(b"> Variant")
+        os.write(self.master, b"us\r")
+        self.wait_for(b"Active: Italian - Italian (US keyboard) (it-us)")
+        self.wait_for(b"Enter: continue   Tab: layout")
+        trial = "Symbols @# and accents èé".encode()
+        os.write(self.master, trial)
+        self.wait_for(trial)
+        self.wait_for(b"Enter: continue   Tab: layout")
+        screen = self.transcript.rsplit(b"\x1b[2J", 1)[-1]
+        self.assertIn(b"italian", screen)
+        self.assertIn(b"Active: Italian - Italian (US keyboard) (it-us)", screen)
+        os.write(self.master, b"\x7f")
+        self.wait_for(b"Enter: continue   Tab: layout")
+        screen = self.transcript.rsplit(b"\x1b[2J", 1)[-1]
+        self.assertIn("Symbols @# and accents è ".encode(), screen)
+        os.write(self.master, b"\x15\r")
+        self.wait_for(b"Choose the destination disk")
+        for expected in (b"Keep the existing home files?", b"Encrypt the system and home?",
+                         b"Choose the language and locale", b"Choose the timezone", b"Computer name",
+                         b"Local username", b"User password"):
+            self.enter(expected)
+        self.finish()
+        self.assertIn(b"console it-us", self.transcript)
+
+    def test_changing_keyboard_clears_trial_and_preserves_selection_when_returning(self):
+        self.enter(b"Enter: continue   Tab: layout")
+        os.write(self.master, b"previous trial\t")
+        self.wait_for(b"> Layout")
+        os.write(self.master, b"italian\t")
+        self.wait_for(b"> Variant")
+        os.write(self.master, b"\x1b[B\t")
+        self.wait_for(b"Active: Italian - Italian (US keyboard) (it-us)")
+        self.wait_for(b"Enter: continue   Tab: layout")
+        screen = self.transcript.rsplit(b"\x1b[2J", 1)[-1]
+        self.assertNotIn(b"previous trial", screen)
+        self.assertIn(b"Type here, or press Enter to continue.", screen)
+        self.enter(b"Choose the destination disk")
+        os.write(self.master, b"\x1b")
+        self.wait_for(b"Enter: select   Tab: next field")
+        screen = self.transcript.rsplit(b"\x1b[2J", 1)[-1]
+        self.assertIn(b"\x1b[7m> Italian", screen)
+        self.assertIn(b"> Italian (US keyboard)", screen)
+        self.assertIn(b"Active: Italian - Italian (US keyboard) (it-us)", screen)
+        self.enter(b"> Variant")
+        self.enter(b"Enter: continue   Tab: layout")
+        self.enter(b"Choose the destination disk")
+
+    def test_keyboard_search_without_matches_can_be_edited_without_advancing(self):
+        os.write(self.master, b"not-a-layout\r\t")
+        self.wait_for(b"No matching choices.")
+        os.write(self.master, b"\x15italian\r")
+        self.wait_for(b"> Variant")
+        os.write(self.master, b"not-a-variant\r")
+        self.wait_for(b"No matching choices.")
+        os.write(self.master, b"\x1b")
+        self.wait_for(b"> Layout")
+        self.enter(b"> Variant")
+        os.write(self.master, b"\x15\x1b[H\r")
+        self.wait_for(b"Active: Italian - Default (it)")
+        self.wait_for(b"Enter: continue   Tab: layout")
+        self.assertNotIn(b"Choose the destination disk", self.transcript)
+        self.enter(b"Choose the destination disk")
+
+    def test_keyboard_lists_scroll_on_a_small_terminal(self):
+        os.write(self.master, b"\x03")
+        self.wait_for(b"Installation cancelled")
+        self.assertEqual(self.process.wait(timeout=5), 1)
+        fcntl.ioctl(self.slave, termios.TIOCSWINSZ, struct.pack("HHHH", 18, 60, 0, 0))
+        self.start_program()
+        os.write(self.master, b"\x1b[F")
+        self.wait_for(b"3 / 3")
+        self.enter(b"> Variant")
+        self.enter(b"Enter: continue   Tab: layout")
+        self.assertIn(b"\x1b[13;", self.transcript)
+        self.enter(b"Choose the destination disk")
+
+    def test_keyboard_trial_can_be_skipped_after_reaching_its_length_limit(self):
+        self.enter(b"Enter: continue   Tab: layout")
+        os.write(self.master, b"x" * 160 + b"\r")
+        self.wait_for(b"Choose the destination disk")
 
     def test_input_cursor_is_inside_the_field(self):
         self.reach_password();self.wait_for(b"\x1b[9;6H")
@@ -417,16 +515,29 @@ class GuidedOrderTests(unittest.TestCase):
 uid_t test_geteuid(void) { return 0; }
 const char *cenere_error(void) { return "Cannot unlock fixture storage"; }
 size_t cenere_keyboards(struct cenere_keyboard *maps,size_t limit,bool demo) {
-    (void)demo;if (!limit) return 0;
-    maps[0]=(struct cenere_keyboard){.keymap="us",.layout="us",.name="English (US)"};return 1;
+    (void)demo;
+    const struct cenere_keyboard fixtures[] = {
+        {.keymap="us",.layout="us",.name="English (US)",.variant_name="Default"},
+        {.keymap="it",.layout="it",.name="Italian",.variant_name="Default"},
+        {.keymap="it-us",.layout="it",.variant="us",.name="Italian",.variant_name="Italian (US keyboard)"}
+    };
+    size_t count=limit<3?limit:3;
+    memcpy(maps,fixtures,count*sizeof(*maps));return count;
 }
 bool cenere_select_keyboard(struct installation_plan *p,const char *k,bool demo) {
-    (void)demo;(void)k;strcpy(p->xkb_layout,"us");return true;
+    struct cenere_keyboard maps[3];
+    size_t count=cenere_keyboards(maps,3,demo);
+    for (size_t i=0;i<count;i++) if (!strcmp(k,maps[i].keymap)) {
+        strcpy(p->keymap,maps[i].keymap);strcpy(p->keymap_group,maps[i].layout);
+        strcpy(p->xkb_layout,maps[i].layout);strcpy(p->xkb_variant,maps[i].variant);return true;
+    }
+    return false;
 }
 bool cenere_apply_keyboard(struct installation_plan *p) {
+    if (getenv("FIXTURE_KEYBOARD_FAILURE")) return false;
     const char *id=getenv("FIXTURE_IMAGE_ID");
     snprintf(p->image_id,sizeof(p->image_id),"%s",id?id:"anser");
-    fputs("APPLIED_KEYBOARD\n",stderr);return true;
+    fprintf(stderr,"APPLIED_KEYBOARD %s\n",p->keymap);return true;
 }
 size_t cenere_disks(struct cenere_disk *d,size_t n) {(void)d;(void)n;return 0;}
 bool cenere_inspect(struct installation_plan *p) {
@@ -452,6 +563,24 @@ int cenere_power(bool reboot) {
 }
 int main(int argc,char **argv) {
     if (argc==2 && !strcmp(argv[1],"--finish-ui")) return finish_installation(true);
+    if (argc==2 && !strcmp(argv[1],"--keyboard-ui")) {
+        struct installation_plan plan;
+        initialize_plan(&plan,REAL_INSTALLATION);
+        strcpy(plan.password,"saved user secret");strcpy(plan.existing_password,"saved disk secret");
+        char applied[64]="";
+        const char *saved=getenv("FIXTURE_SAVED_KEYMAP");
+        if (saved) {
+            if (!cenere_select_keyboard(&plan,saved,false)) return 1;
+            snprintf(applied,sizeof(applied),"%s",saved);
+        }
+        ui_active_plan=&plan;
+        if (!ui_begin()) return 1;
+        enum ui_result result=ui_keyboard_page(&plan,REAL_INSTALLATION,applied,sizeof(applied));
+        ui_end();ui_active_plan=NULL;
+        printf("KEYBOARD_RESULT keymap=%s user_password=%s disk_password=%s\n",plan.keymap,
+               *plan.password?"saved":"cleared",*plan.existing_password?"saved":"cleared");
+        return result==UI_NEXT?0:1;
+    }
     return cenere_main(argc,argv);
 }
 """)
@@ -469,6 +598,68 @@ int main(int argc,char **argv) {
         if action is not None:values.append(action)
         return subprocess.run([str(self.driver),"--install","/dev/example"],input="\n".join(values)+"\n",
             text=True,capture_output=True,timeout=5,env={**os.environ,"TERM":"dumb",**(extra_env or {})})
+
+    def keyboard_session(self, steps, extra_env=None, status=0):
+        master, slave = os.openpty()
+        original = termios.tcgetattr(slave)
+        process = subprocess.Popen([str(self.driver), "--keyboard-ui"], stdin=slave, stdout=slave,
+                                   stderr=slave, env={**os.environ, "TERM": "xterm", **(extra_env or {})})
+        transcript = b""
+        position = 0
+        try:
+            for expected, keys in steps:
+                deadline = time.monotonic() + 5
+                while expected not in transcript[position:]:
+                    remaining = deadline - time.monotonic()
+                    self.assertGreater(remaining, 0, transcript[-1000:])
+                    if select.select([master], [], [], remaining)[0]:
+                        transcript += os.read(master, 65536)
+                position = transcript.index(expected, position) + len(expected)
+                os.write(master, keys)
+            self.assertEqual(process.wait(timeout=5), status)
+            while select.select([master], [], [], 0)[0]:
+                transcript += os.read(master, 65536)
+            self.assertEqual(termios.tcgetattr(slave), original)
+            for secret in (b"saved user secret", b"saved disk secret"):
+                self.assertNotIn(secret, transcript)
+            return transcript
+        finally:
+            if process.poll() is None:
+                process.kill()
+            process.wait(timeout=5)
+            os.close(master)
+            os.close(slave)
+
+    def test_keyboard_applies_before_optional_trial_and_does_not_reapply_unchanged_selection(self):
+        transcript = self.keyboard_session([
+            (b"Enter: select", b"\r"),
+            (b"Enter: continue", b"\t"),
+            (b"Enter: select", b"\r"),
+            (b"Enter: continue", b"\r"),
+        ])
+        self.assertEqual(transcript.count(b"APPLIED_KEYBOARD"), 1)
+        self.assertLess(transcript.index(b"APPLIED_KEYBOARD us"),
+                        transcript.index(b"> Test the keyboard (optional)"))
+        self.assertIn(b"keymap=us user_password=saved disk_password=saved", transcript)
+
+    def test_keyboard_change_clears_saved_passwords_before_continuing(self):
+        transcript = self.keyboard_session([
+            (b"Enter: select", b"\r"),
+            (b"Enter: continue", b"trial text\t"),
+            (b"Enter: select", b"italian\r"),
+            (b"> Variant", b"\x1b[B\r"),
+            (b"Enter: continue", b"\r"),
+        ], extra_env={"FIXTURE_SAVED_KEYMAP": "us"})
+        self.assertEqual(transcript.count(b"APPLIED_KEYBOARD"), 1)
+        self.assertIn(b"APPLIED_KEYBOARD it-us", transcript)
+        self.assertIn(b"keymap=it-us user_password=cleared disk_password=cleared", transcript)
+
+    def test_keyboard_apply_failure_blocks_trial_and_continuation(self):
+        transcript = self.keyboard_session([(b"Enter: select", b"\r")],
+                                           extra_env={"FIXTURE_KEYBOARD_FAILURE": "1"}, status=1)
+        self.assertIn(b"Cannot unlock fixture storage", transcript)
+        self.assertNotIn(b"> Test the keyboard (optional)", transcript)
+        self.assertNotIn(b"Enter: continue", transcript)
 
     def test_default_hostname_uses_the_prepared_distribution(self):
         for image,expected in (("anser","anser"),("arch","arch"),("--my_distro--","my-distro"),("___","linux")):
