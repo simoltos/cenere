@@ -37,6 +37,7 @@ bool cenere_apply_keyboard(struct installation_plan *plan);
 
 size_t cenere_disks(struct cenere_disk *disks, size_t limit);
 bool cenere_inspect(struct installation_plan *plan);
+bool cenere_check_storage(struct installation_plan *plan);
 bool cenere_preflight(struct installation_plan *plan);
 typedef void (*cenere_progress_callback)(const char *phase, const char *detail,
                                          const char *log_path, uint64_t elapsed);

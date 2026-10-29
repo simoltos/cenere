@@ -513,6 +513,7 @@ class GuidedOrderTests(unittest.TestCase):
 #undef main
 #undef geteuid
 uid_t test_geteuid(void) { return 0; }
+static cenere_progress_callback fixture_progress;
 const char *cenere_error(void) { return "Cannot unlock fixture storage"; }
 size_t cenere_keyboards(struct cenere_keyboard *maps,size_t limit,bool demo) {
     (void)demo;
@@ -541,18 +542,25 @@ bool cenere_apply_keyboard(struct installation_plan *p) {
 }
 size_t cenere_disks(struct cenere_disk *d,size_t n) {(void)d;(void)n;return 0;}
 bool cenere_inspect(struct installation_plan *p) {
+    if (fixture_progress) fixture_progress("Unlocking existing storage","Checking the supplied password","",0);
     strcpy(p->snapshot,"fixture");p->locked_storage=!*p->existing_password;
     p->existing_home=true;p->existing_os=true;
     if (p->locked_storage) {fputs("DISCOVER_LOCKED\n",stderr);return true;}
     if (strcmp(p->existing_password,"old secret")) return false;
-    p->existing_encryption=true;fputs("DISCOVER_UNLOCKED_HOME\n",stderr);return true;
+    p->existing_encryption=true;
+    if (fixture_progress) fixture_progress("Reading filesystem layout","Inspecting root and home","",1);
+    fputs("DISCOVER_UNLOCKED_HOME\n",stderr);return true;
 }
 bool cenere_preflight(struct installation_plan *p) {
     fputs("PREFLIGHT\n",stderr);
     return p->discard_encrypted ? !p->preserve_home && !p->alongside :
         !strcmp(p->existing_password,"old secret") && p->preserve_home;
 }
-void cenere_set_progress_callback(cenere_progress_callback callback) { (void)callback; }
+bool cenere_check_storage(struct installation_plan *p) {
+    (void)p;fputs("STORAGE_CHECK\n",stderr);
+    return !getenv("FIXTURE_STORAGE_FAILURE");
+}
+void cenere_set_progress_callback(cenere_progress_callback callback) { fixture_progress=callback; }
 int cenere_install(const struct installation_plan *p) {
     printf("STUB_INSTALL hostname=%s\n",p->hostname);
     return atoi(getenv("FIXTURE_INSTALL_STATUS")?getenv("FIXTURE_INSTALL_STATUS"):"0");
@@ -563,6 +571,16 @@ int cenere_power(bool reboot) {
 }
 int main(int argc,char **argv) {
     if (argc==2 && !strcmp(argv[1],"--finish-ui")) return finish_installation(true);
+    if (argc==2 && !strcmp(argv[1],"--inspection-ui")) {
+        struct installation_plan plan;
+        initialize_plan(&plan,REAL_INSTALLATION);
+        strcpy(plan.existing_password,"old secret");
+        ui_active_plan=&plan;
+        if (!ui_begin()) return 1;
+        bool ok=ui_inspect_storage(&plan,UI_UNLOCK_PASSWORD);
+        ui_end();ui_active_plan=NULL;
+        return ok?0:1;
+    }
     if (argc==2 && !strcmp(argv[1],"--keyboard-ui")) {
         struct installation_plan plan;
         initialize_plan(&plan,REAL_INSTALLATION);
@@ -759,6 +777,35 @@ int main(int argc,char **argv) {
         result=self.invoke(["unlock","old secret","replace","yes"],"install")
         self.assertEqual(result.returncode,1,result.stderr)
         self.assertNotIn("STUB_INSTALL",result.stdout)
+
+    def test_unusable_storage_is_rejected_before_account_questions(self):
+        result=self.invoke(["unlock","old secret","replace","yes"],
+                           extra_env={"FIXTURE_STORAGE_FAILURE":"1"})
+        self.assertEqual(result.returncode,1,result.stderr)
+        self.assertIn("STORAGE_CHECK",result.stderr)
+        self.assertNotIn("Hostname",result.stderr)
+        self.assertNotIn("User password",result.stderr)
+        self.assertNotIn("STUB_INSTALL",result.stdout)
+
+    def test_unlock_inspection_displays_distinct_phases_without_password(self):
+        master,slave=os.openpty()
+        original=termios.tcgetattr(slave)
+        process=subprocess.Popen([str(self.driver),'--inspection-ui'],stdin=slave,stdout=slave,stderr=slave,
+                                 env={**os.environ,'TERM':'xterm'})
+        transcript=b''
+        try:
+            while process.poll() is None:
+                if select.select([master],[],[],0.1)[0]:transcript+=os.read(master,65536)
+            while select.select([master],[],[],0)[0]:transcript+=os.read(master,65536)
+            self.assertEqual(process.returncode,0,transcript)
+            self.assertIn(b'Unlocking existing storage',transcript)
+            self.assertIn(b'Reading filesystem layout',transcript)
+            self.assertNotIn(b'old secret',transcript)
+            self.assertEqual(termios.tcgetattr(slave),original)
+        finally:
+            if process.poll() is None:process.kill()
+            process.wait(timeout=5)
+            os.close(master);os.close(slave)
 
 
 class InstallationTests(unittest.TestCase):

@@ -480,7 +480,8 @@ static void interrupt_password(int number)
     if (password_echo_hidden)
         tcsetattr(STDIN_FILENO, TCSANOW, &password_terminal);
     /* Cancel on job suspension too, so the shell never inherits hidden input. */
-    write(STDERR_FILENO, "\n", 1);
+    ssize_t written = write(STDERR_FILENO, "\n", 1);
+    (void)written; /* Terminal output is best effort while exiting a signal handler. */
     _exit(128 + number);
 }
 
@@ -1041,7 +1042,8 @@ static void ui_interrupt(int number)
 {
     if (ui_terminal_active) {
         tcsetattr(STDIN_FILENO, TCSANOW, &ui_saved_terminal);
-        write(STDOUT_FILENO, "\033[?25h\033[?1049l", 14);
+        ssize_t written = write(STDOUT_FILENO, "\033[?25h\033[?1049l", 14);
+        (void)written;
     }
     _exit(128 + number);
 }
@@ -1723,6 +1725,44 @@ done:
     return result;
 }
 
+static void ui_check_progress(const char *, const char *, const char *, uint64_t);
+static enum ui_page checking_page = UI_REVIEW;
+
+static bool ui_inspect_storage(struct installation_plan *plan, enum ui_page page)
+{
+    checking_page=page;
+    cenere_set_progress_callback(ui_check_progress);
+    bool ok=cenere_inspect(plan);
+    cenere_set_progress_callback(NULL);
+    checking_page=UI_REVIEW;
+    return ok;
+}
+
+static enum ui_result ui_storage_problem(void)
+{
+    char message[512];snprintf(message,sizeof(message),"%s",cenere_error());
+    for (;;) {
+        ui_header("This storage choice cannot be used",UI_ENCRYPTION,REAL_INSTALLATION,false);
+        size_t width=ui_panel_width(),row=6;
+        const char *at=message;
+        while (*at && row+3<ui_lines()) {
+            size_t length=strlen(at),take=length<width?length:width;
+            if (take<length) {
+                size_t word=take;
+                while (word && at[word]!=' ') word--;
+                if (word) take=word;
+            }
+            char line[513];snprintf(line,sizeof(line),"%.*s",(int)take,at);
+            ui_row(row++,line);at+=take;while (*at==' ') at++;
+        }
+        ui_center(ui_lines()-2,"Enter/Esc: change disk choices   Ctrl+C: cancel");
+        fflush(stdout);
+        int key=ui_key();
+        if (key==3 || key==UI_KEY_EOF) return UI_CANCEL;
+        if (key=='\n' || key=='\r' || key==27) return UI_BACK;
+    }
+}
+
 static enum ui_result ui_destination(struct installation_plan *plan, enum execution_mode mode)
 {
     char previous[PATH_MAX];
@@ -1756,7 +1796,7 @@ static enum ui_result ui_destination(struct installation_plan *plan, enum execut
         if (strcmp(previous,plan->target))
             explicit_bzero(plan->existing_password,sizeof(plan->existing_password));
         if (strcmp(previous,plan->target)) plan->discard_encrypted=false;
-        if (!cenere_inspect(plan)) {
+        if (!ui_inspect_storage(plan,UI_DESTINATION)) {
             ui_end();
             fprintf(stderr, "%s\n", cenere_error());
             return UI_CANCEL;
@@ -1795,7 +1835,6 @@ static enum ui_result ui_encryption(struct installation_plan *plan, enum executi
 }
 
 static void show_plan(FILE *, const struct installation_plan *, enum execution_mode);
-static void ui_check_progress(const char *, const char *, const char *, uint64_t);
 
 static enum ui_result ui_review(const struct installation_plan *plan, enum execution_mode mode)
 {
@@ -1911,7 +1950,7 @@ static bool ui_wizard(struct installation_plan *plan, enum execution_mode mode)
             result=ui_text("Existing disk password (unlock for inspection)",plan->existing_password,
                            sizeof(plan->existing_password),true,true,NULL,page,mode,unlock_error);
             if (result==UI_NEXT) {
-                if (!cenere_inspect(plan)) {
+                if (!ui_inspect_storage(plan,UI_UNLOCK_PASSWORD)) {
                     explicit_bzero(plan->existing_password,sizeof(plan->existing_password));
                     unlock_error=cenere_error();continue;
                 }
@@ -1941,6 +1980,14 @@ static bool ui_wizard(struct installation_plan *plan, enum execution_mode mode)
             break;
         case UI_ENCRYPTION:
             result = ui_encryption(plan, mode);
+            if (result==UI_NEXT && mode==REAL_INSTALLATION) {
+                checking_page=UI_ENCRYPTION;
+                cenere_set_progress_callback(ui_check_progress);
+                bool ready=cenere_check_storage(plan);
+                cenere_set_progress_callback(NULL);
+                checking_page=UI_REVIEW;
+                if (!ready) result=ui_storage_problem();
+            }
             break;
         case UI_LOCALE:
             result = ui_catalog_menu("Choose the language and locale", plan->locale,
@@ -2085,6 +2132,10 @@ static bool collect_choices(struct installation_plan *plan, enum execution_mode 
                       NULL))
         return false;
     plan->encrypt = strcmp(encryption, "yes") == 0;
+    if (mode==REAL_INSTALLATION && !cenere_check_storage(plan)) {
+        fprintf(stderr,"%s\n",cenere_error());
+        return false;
+    }
     suggest_hostname(plan);
     fprintf(stderr,"\n1 of 4: Preferences\n");
     if (!ask_question("System locale (for example en_US.UTF-8)", plan->locale, sizeof(plan->locale),
@@ -2146,7 +2197,7 @@ static void describe_step(FILE *output, enum installation_step step,
         break;
     case FORMAT_HOME:
         fprintf(output, "Create the home subvolume in the shared Btrfs filesystem%s.\n",
-                plan->existing_home && !plan->preserve_home
+                plan->existing_home && !plan->preserve_home && !plan->alongside
                     ? "; existing home files will be replaced"
                     : "");
         break;
@@ -2376,13 +2427,14 @@ static bool validate_real_plan(struct installation_plan *plan)
 static void ui_progress_screen(const char *phase, const char *detail,
                                const char *log_path, uint64_t elapsed, bool checking)
 {
-    ui_header(checking ? "Checking the installation plan" : "Installing the system",
-              checking ? UI_REVIEW : UI_PAGE_COUNT, REAL_INSTALLATION, false);
+    ui_header(checking ? "Preparing the installation" : "Installing the system",
+              checking ? checking_page : UI_PAGE_COUNT, REAL_INSTALLATION, false);
     ui_row(6, phase);
     if (strcmp(phase, detail))
         ui_row(8, detail);
     char clock[80];
-    snprintf(clock, sizeof(clock), "%s: %llu:%02llu:%02llu", checking ? "Elapsed" : "Total elapsed",
+    snprintf(clock, sizeof(clock), "%c %s: %llu:%02llu:%02llu", "|/-\\"[elapsed%4],
+             checking ? "Elapsed" : "Total elapsed",
              (unsigned long long)elapsed / 3600, (unsigned long long)elapsed / 60 % 60,
              (unsigned long long)elapsed % 60);
     ui_row(10, clock);

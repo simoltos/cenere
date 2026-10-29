@@ -38,7 +38,7 @@ PASSWORD_PROMPT = rb"(?i:Please enter passphrase|Enter passphrase)[^\r\n]{0,300}
 def artifact(path):
     original = Path(path).absolute()
     path = original.resolve()
-    if not (PROJECT / "mkanseriso").is_file():
+    if not (PROJECT / "local/mkanseriso").is_file():
         raise ValueError("Set ANSER_PROJECT to the Anser repository root")
     if "," in str(path):
         raise ValueError("VM paths cannot contain QEMU option separators")
@@ -160,7 +160,8 @@ pacman -Rns --noconfirm oca
 
 class VM:
     def __init__(self, directory, iso=None, disk=None, memory=6144, upload_image=None,
-                 graphics=False, network=False):
+                 graphics=False, network=False, firmware="uefi", kernel=None, initrd=None,
+                 kernel_args=""):
         self.directory = artifact(directory)
         self.directory.mkdir(parents=True, exist_ok=True)
         self.lock = artifact(self.directory / ".vm.lock").open("a")
@@ -187,6 +188,14 @@ class VM:
             raise ValueError("Upload media must be a regular disposable file")
         self.graphics = graphics
         self.network = network
+        if firmware not in ("uefi", "bios"):
+            raise ValueError("Unknown test firmware")
+        if bool(kernel) != bool(initrd):
+            raise ValueError("Direct boot requires both kernel and initrd")
+        self.firmware = firmware
+        self.kernel = artifact(kernel) if kernel else None
+        self.initrd = artifact(initrd) if initrd else None
+        self.kernel_args = kernel_args
         self.process = None
         self.serial = self.qmp = None
         self.pending = b""
@@ -200,20 +209,27 @@ class VM:
         if self.process is not None:
             raise RuntimeError("VM instance cannot be started twice")
         variables = artifact(self.directory / "OVMF_VARS.fd")
-        if not variables.exists():
+        if self.firmware == "uefi" and not variables.exists():
             shutil.copyfile(FIRMWARE / "OVMF_VARS.fd", variables)
         serial_path = artifact(self.directory / "serial.sock")
         qmp_path = artifact(self.directory / "qmp.sock")
         for path in (serial_path, qmp_path):
             path.unlink(missing_ok=True)
+        # Keep the disk in the firmware boot order while selecting the ISO;
+        # OVMF can otherwise prune its saved operating-system entries.
         args = ["/usr/bin/qemu-system-x86_64", "-machine", "q35,accel=kvm", "-cpu", "host",
                 "-smp", "4", "-m", str(self.memory), "-nic",
                 "user,model=virtio-net-pci" if self.network else "none",
-                "-drive", f"if=pflash,format=raw,readonly=on,file={FIRMWARE / 'OVMF_CODE.fd'}",
-                "-drive", f"if=pflash,format=raw,file={variables}",
-                "-drive", f"if=virtio,format=qcow2,file={self.disk}",
+                "-drive", f"if=none,id=systemdisk,format=qcow2,file={self.disk}",
+                "-device", "virtio-blk-pci,drive=systemdisk" + (",bootindex=2" if self.iso else ""),
                 "-serial", f"unix:{serial_path},server=on,wait=off",
                 "-qmp", f"unix:{qmp_path},server=on,wait=off", "-no-reboot"]
+        if self.firmware == "uefi":
+            args.extend(["-drive", f"if=pflash,format=raw,readonly=on,file={FIRMWARE / 'OVMF_CODE.fd'}",
+                         "-drive", f"if=pflash,format=raw,file={variables}"])
+        if self.kernel:
+            args.extend(["-kernel", str(self.kernel), "-initrd", str(self.initrd),
+                         "-append", self.kernel_args])
         if self.graphics:
             # Match runvm's graphics/input devices; QMP supplies the test display.
             args.extend(["-display", "none", "-vga", "std",
@@ -307,8 +323,7 @@ class VM:
 
     def send_secret(self, value):
         self.secrets.add(value.encode())
-        # systemd's ask-password console explicitly offers TAB to suppress echo.
-        self.send("\t" + value + "\r")
+        self.send(value + "\r")
 
     def expect(self, expression, timeout=120):
         pattern = re.compile(expression.encode() if isinstance(expression, str) else expression,
@@ -333,45 +348,34 @@ class VM:
             elif self.process.poll() is not None:
                 raise RuntimeError("QEMU exited; inspect qemu.log")
 
-    def boot_iso(self, workarounds=False, wait_ready=True, kernel="linux-cachyos", graphical=False):
-        """Boot ISO's kernel/initramfs through its actual GRUB and OVMF."""
-        if kernel not in ("linux-cachyos", "linux-cachyos-lts"):
-            raise ValueError("Unsupported ISO kernel selection")
-        self.expect(b"Anser", 90)
-        self.keyboard("c")
-        self.expect(b"grub>", 10)
-        commands = [
-            "terminal_input console; terminal_output serial",
-            f"search --file --set=root /arch/boot/x86_64/vmlinuz-{kernel}",
-            "probe --set=iso_uuid --fs-uuid ($root)",
-            "set opts=archisobasedir=arch",
-            'set opts="$opts archisosearchuuid=$iso_uuid"',
-        ]
-        options = ["cow_spacesize=10G", "console=ttyS0,115200", "systemd.debug_shell=ttyS0",
-                   "systemd.mask=serial-getty@ttyS0.service"]
-        if workarounds:
-            options += ["systemd.mask=systemd-firstboot.service", "systemd.mask=systemd-time-wait-sync.service"]
-        if not graphical:
-            options += ["systemd.unit=multi-user.target"]
-        commands += [f'set opts="$opts {option}"' for option in options]
-        commands += [f"linux /arch/boot/x86_64/vmlinuz-{kernel} $opts",
-                     f"initrd /arch/boot/x86_64/initramfs-{kernel}.img"]
-        (self.directory / "boot-commands.json").write_text(json.dumps(commands, indent=2) + "\n")
-        for line in commands:
-            # EFI and GRUB UART polling can consume bytes out of order. Use
-            # the emulated keyboard for firmware, then Linux's buffered tty.
-            self.keyboard(line + "\n")
-            self.expect(rb"\n\rgrub> ", 30)
-        self.keyboard("boot\n")
-        self.expect(rb"(?:sh|bash)-[^\r\n]*#", 180)
-        # Commands and any later passwords must not be echoed into transcripts.
+    def boot_iso(self, workarounds=False, wait_ready=True, kernel="linux", graphical=False,
+                 copy_to_ram=False):
+        """Boot the ISO through its systemd-boot menu with serial test access."""
+        if kernel != "linux":
+            raise ValueError("The Anser image uses the standard Arch kernel")
+        if not self.kernel:
+            self.expect(b"Anser install medium",90)
+            self.keyboard("e")
+            self.expect(b"archisobasedir=arch",15)
+            self.monitor("send-key",{"keys":[{"type":"qcode","data":"home"}],"hold-time":20})
+            options=["cow_spacesize=10G","console=ttyS0,115200n8","systemd.debug_shell=ttyS0",
+                     "systemd.mask=serial-getty@ttyS0.service"]
+            if workarounds:
+                options += ["systemd.mask=systemd-firstboot.service","systemd.mask=systemd-time-wait-sync.service"]
+            if not graphical:
+                options.append("systemd.unit=multi-user.target")
+            if copy_to_ram:
+                options.append("copytoram=y")
+            self.keyboard(" "+" ".join(options)+" ")
+            self.keyboard("\n")
+        self.expect(rb"(?:sh|bash)-[^\r\n]*#",180)
         self.send("stty -echo; export PS1='CENERE_VM# ' PS2='' SYSTEMD_PAGER=cat "
                   "PAGER=cat SYSTEMD_COLORS=0 TERM=dumb; printf '\\nREADY\\n'\r")
-        self.expect(rb"\r?\nREADY\r?\n", 30)
-        self.shell_ready = True
+        self.expect(rb"\r*\nREADY\r*\n",30)
+        self.shell_ready=True
         if wait_ready:
-            target = "graphical.target" if graphical else "multi-user.target"
-            self.command(f"while ! systemctl is-active --quiet {target}; do sleep 1; done", 180)
+            target="graphical.target" if graphical else "multi-user.target"
+            self.command(f"while ! systemctl is-active --quiet {target}; do sleep 1; done",180)
 
     def screenshot(self, name="screen.png"):
         destination = artifact(self.directory / name)
@@ -423,16 +427,15 @@ class VM:
             raise ValueError("Installed-system boot requires the ISO to be detached")
         if passphrase:
             self.secrets.add(passphrase.encode())
-        expression = rb"(?:sh|bash)-[^\r\n]*#|" + PASSWORD_PROMPT
-        for _ in range(4):
-            _, match = self.expect(expression, 180)
-            if match[0].endswith(b"#"):
-                break
+        shell = rb"(?:sh|bash)-[^\r\n]*#"
+        _, match = self.expect(shell + b"|" + PASSWORD_PROMPT, 180)
+        if not match[0].endswith(b"#"):
             if passphrase is None:
                 raise RuntimeError("Installed system requested an encryption passphrase")
             self.send_secret(passphrase)
-        else:
-            raise RuntimeError("Encrypted boot did not accept the passphrase")
+            # Plymouth redraws its prompt for every typed character. These are
+            # not new password requests; send the known test secret only once.
+            self.expect(shell, 180)
         self.send("stty -echo; export PS1='CENERE_VM# ' PS2='' SYSTEMD_PAGER=cat "
                   "PAGER=cat SYSTEMD_COLORS=0 TERM=dumb; printf '\\nREADY\\n'\r")
         self.expect(rb"\r?\nREADY\r?\n", 30)

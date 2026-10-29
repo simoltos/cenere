@@ -35,6 +35,25 @@ int intercepted_stat(const char *path, struct stat *result)
 }
 int intercepted_execv(const char *path, char *const args[])
 {
+    const char *shrink=getenv("CENERE_TEST_SHRINK_FAILURE");
+    if (shrink) {
+        FILE *calls=fopen(getenv("CENERE_TEST_CALLS"),"a");
+        if (!calls) _exit(98);
+        for (size_t i=0;args[i];i++) fprintf(calls,"%s%s",i?" ":"",args[i]);
+        fputc('\n',calls);fclose(calls);
+        if (!strcmp(path,"/usr/bin/sfdisk") && !strcmp(args[1],"--dump")) {
+            puts("label: gpt\n/dev/example1 : start=2048, size=83886080, type=0FC63DAF-8483-4772-8E79-3D69D8477DE4");
+            fflush(stdout);_exit(0);
+        }
+        if (!strcmp(path,"/usr/bin/e2fsck")) _exit(!strcmp(shrink,"check")?4:0);
+        if (!strcmp(path,"/usr/bin/resize2fs")) _exit(!strcmp(shrink,"resize")?1:0);
+        if (!strcmp(path,"/usr/bin/dumpe2fs")) {
+            puts("Block count: 33554432\nBlock size: 4096\n");fflush(stdout);_exit(0);
+        }
+        if (!strcmp(path,"/usr/bin/ntfsresize"))
+            _exit(!strcmp(shrink,"ntfs-check") || strcmp(args[1],"--no-action")?1:0);
+        _exit(99);
+    }
     if (!strcmp(path,"/usr/bin/blkid")) {
         if (strcmp(args[1],"--probe")) _exit(99);
         const char *identity=getenv("CENERE_TEST_IDENTITY"), *status=getenv("CENERE_TEST_PROBE_STATUS");
@@ -47,13 +66,27 @@ int intercepted_execv(const char *path, char *const args[])
         fflush(stdout);
         _exit(getenv("CENERE_TEST_WIPE_FAIL")?1:0);
     }
-    /* Only du may execute: plans use temporary source directories. */
-    if (!strcmp(path,"/usr/bin/du")) return execv(path,args);
+    /* These file operations use disposable fixtures; no disk utility executes. */
+    if (!strcmp(path,"/usr/bin/rsync") && getenv("CENERE_TEST_RSYNC_FAIL")) _exit(37);
+    if (!strcmp(path,"/usr/bin/du") || !strcmp(path,"/usr/bin/rsync")) return execv(path,args);
     _exit(99);
 }
 int main(int argc, char **argv)
 {
     if (argc!=3) return 2;
+    if (!strcmp(argv[1],"shrink-failure")) {
+        snprintf(work,sizeof(work),"%s",argv[2]);
+        struct storage s={.sector=512,.count=1,.shrink=0,.gpt=true};
+        struct installation_plan p={0};
+        snprintf(p.target,sizeof(p.target),"/dev/example");
+        s.parts[0]=(struct partition){.start=2048,.size=40*GiB/512,.original_size=60*GiB/512,.keep=true};
+        snprintf(s.parts[0].device,sizeof(s.parts[0].device),"/dev/example1");
+        snprintf(s.parts[0].fs,sizeof(s.parts[0].fs),"%s",
+                 !strncmp(getenv("CENERE_TEST_SHRINK_FAILURE"),"ntfs",4)?"ntfs":"ext4");
+        bool ok=partition_disk(&s,&p);
+        if (!ok) fprintf(stderr,"%s\n",cenere_error());
+        return ok?0:1;
+    }
     if (!strcmp(argv[1],"uuid")) {
         char value[128];
         bool ok=uuid("/dev/cenere-test",argv[2],value,sizeof(value));
@@ -91,11 +124,11 @@ int main(int argc, char **argv)
         if (!ok) fprintf(stderr,"%s\n",cenere_error());
         return ok?0:1;
     }
-    if (!strcmp(argv[1],"clear-kernels")) {
-        char previous[PATH_MAX],target[PATH_MAX];
-        snprintf(previous,sizeof(previous),"%s/previous",argv[2]);
-        snprintf(target,sizeof(target),"%s/target",argv[2]);
-        bool ok=clear_previous_kernels(previous,target);
+    if (!strcmp(argv[1],"preserve-boot")) {
+        char boot[PATH_MAX],backup[PATH_MAX];
+        snprintf(boot,sizeof(boot),"%s/boot",argv[2]);
+        snprintf(backup,sizeof(backup),"%s/backup",argv[2]);
+        bool ok=preserve_boot_files(boot,backup);
         if (!ok) fprintf(stderr,"%s\n",cenere_error());
         return ok?0:1;
     }
@@ -125,18 +158,35 @@ int main(int argc, char **argv)
         }
         p.preserve_home=true;
         s.home_used=1*GiB;
-        s.btrfs_home=s.arch_btrfs=true;
-        s.btrfs_available=20*GiB;
+        s.home_measured=true;
+        s.system_available=20*GiB;
         s.root_id=256; s.home_id=257;
         snprintf(s.root_subvol,sizeof(s.root_subvol),"@");
         snprintf(s.home_subvol,sizeof(s.home_subvol),"@home");
         if (!strcmp(argv[1],"encrypted")) p.encrypt=s.encrypted_home=true;
         if (!strcmp(argv[1],"change-encryption")) p.encrypt=true;
         if (!strcmp(argv[1],"remove-encryption")) s.encrypted_home=true;
-        if (!strcmp(argv[1],"foreign")) s.arch_btrfs=false;
-        if (!strcmp(argv[1],"ext4")) s.arch_btrfs=s.btrfs_home=false;
+        if (!strcmp(argv[1],"foreign")) {
+            snprintf(s.root_subvol,sizeof(s.root_subvol),"system-volume");
+            snprintf(s.home_subvol,sizeof(s.home_subvol),"personal-data");
+        }
+        if (!strcmp(argv[1],"inline-copy")) s.inline_home=true;
+        if (!strcmp(argv[1],"unsupported-home")) s.home=s.source_home=-1;
+        if (!strcmp(argv[1],"missing-boot")) s.old_boot=-1;
+        if (!strcmp(argv[1],"mbr-preservation")) s.gpt=false;
+        if (!strcmp(argv[1],"alongside-free")) p.alongside=true;
+        if (!strcmp(argv[1],"fedora-full-disk")) {
+            s.count=0;s.bios=-1;s.bytes=512110190592ULL;s.last=s.bytes/512-34;
+            s.esp=append_partition(&s,p.target,2048,1228800,ESP_TYPE);
+            s.old_boot=append_partition(&s,p.target,1230848,4194304,LINUX_TYPE);
+            s.home=append_partition(&s,p.target,5425152,994789376,LINUX_TYPE);
+            s.source_home=s.home;s.home_used=170*GiB;s.system_available=296*GiB;
+            p.encrypt=s.encrypted_home=true;
+            snprintf(s.root_subvol,sizeof(s.root_subvol),"root");
+            snprintf(s.home_subvol,sizeof(s.home_subvol),"home");
+        }
         if (!strcmp(argv[1],"ambiguous")) s.ambiguous_home=true;
-        if (!strcmp(argv[1],"full")) s.btrfs_available=0;
+        if (!strcmp(argv[1],"full")) s.system_available=0;
     }
     if (!plan_storage(&s,&p)) { fprintf(stderr,"%s\n",cenere_error()); return 1; }
     printf("shared=%d reuse=%d count=%zu source-kept=%d\n",s.root==s.home,s.reuse_btrfs,
@@ -197,11 +247,36 @@ class StorageTests(unittest.TestCase):
                 self.assertNotIn("CREATE", result)
 
     def test_other_layouts_copy_home_without_reusing_or_formatting_source(self):
-        for mode in ("ext4", "foreign", "change-encryption", "remove-encryption"):
+        for mode in ("inline-copy", "change-encryption", "remove-encryption"):
             with self.subTest(mode=mode):
                 result = self.invoke(mode, self.base)
                 self.assertIn("shared=1 reuse=0 count=6 source-kept=1", result)
                 self.assertIn("source home retained; files copied and verified", result)
+
+    def test_btrfs_reuse_is_independent_of_distribution_and_subvolume_names(self):
+        result=self.invoke("foreign",self.base)
+        self.assertIn("reuse=1",result)
+        self.assertIn("KEEP home subvolume personal-data",result)
+        result=self.invoke("fedora-full-disk",self.base)
+        self.assertIn("shared=1 reuse=1 count=3 source-kept=1",result)
+        self.assertIn("KEEP home subvolume home",result)
+        self.assertNotIn("CREATE",result)
+
+    def test_unsupported_home_is_rejected_before_planning_changes(self):
+        output=self.invoke("unsupported-home",self.base,success=False)
+        self.assertIn("compatible Btrfs layout",output)
+
+    def test_reuse_requires_a_boot_partition_and_gpt(self):
+        for mode in ("missing-boot","mbr-preservation"):
+            with self.subTest(mode=mode):
+                self.invoke(mode,self.base,success=False)
+
+    def test_alongside_keeps_original_home_and_uses_shared_btrfs_destination(self):
+        result=self.invoke("alongside-free",self.base)
+        self.assertIn("shared=1 reuse=0",result)
+        self.assertIn("source-kept=1",result)
+        self.assertNotIn("DELETE",result)
+        self.assertIn("files copied and verified",result)
 
     def test_only_new_confirmed_partitions_can_have_signatures_erased(self):
         output=self.invoke("clear-partition","new")
@@ -210,6 +285,20 @@ class StorageTests(unittest.TestCase):
             output=self.invoke("clear-partition",state,success=False)
             self.assertNotIn("/usr/bin/wipefs",output)
             self.assertIn("Refusing to erase",output)
+
+    def test_failed_shrink_never_reduces_partition_boundaries(self):
+        for failure in ('check','resize','geometry','ntfs-check','ntfs-resize'):
+            with self.subTest(failure=failure):
+                calls=self.base/(failure+'.calls')
+                self.invoke('shrink-failure',self.base,success=False,extra_env={
+                    'CENERE_TEST_SHRINK_FAILURE':failure,'CENERE_TEST_CALLS':str(calls)})
+                commands=calls.read_text()
+                self.assertIn('sfdisk --dump',commands)
+                self.assertNotIn('sfdisk --lock',commands)
+                if failure=='check':
+                    self.assertNotIn('resize2fs',commands)
+                if failure=='ntfs-check':
+                    self.assertNotIn('ntfsresize --size',commands)
 
     def test_signature_erasure_failure_stops_preparation(self):
         self.invoke("clear-partition","new",success=False,extra_env={"CENERE_TEST_WIPE_FAIL":"1"})
@@ -296,24 +385,28 @@ class StorageTests(unittest.TestCase):
             listing.write_text("".join(n+"\n" for n in names if n!=missing)+missing+"-wrong\n")
             self.invoke("initramfs-list",listing,success=False)
 
-    def test_reused_boot_removes_only_previous_kernel_artifacts(self):
-        for invalid in (False,True,"empty"):
-            with self.subTest(invalid=invalid), tempfile.TemporaryDirectory(dir=self.base) as temporary:
-                root=Path(temporary)
-                modules=root/"previous/usr/lib/modules/old-version"
-                modules.mkdir(parents=True)
-                (modules/"pkgbase").write_text("" if invalid=="empty" else "../unsafe\n" if invalid else "linux-cachyos\n")
-                (modules/"vmlinuz").write_bytes(b"previous kernel fixture")
-                boot=root/"target/boot";boot.mkdir(parents=True)
-                names=["vmlinuz-linux-cachyos","initramfs-linux-cachyos.img","initramfs-linux-cachyos-fallback.img"]
-                for name in [*names,"vmlinuz-linux","custom-data"]:(boot/name).write_bytes(name.encode())
-                (boot/"EFI/OtherOS").mkdir(parents=True)
-                (boot/"EFI/OtherOS/loader.efi").write_bytes(b"preserve")
+    def test_reused_boot_is_verified_before_kernel_retirement(self):
+        for failure in (False,True):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory(dir=self.base) as temporary:
+                root=Path(temporary);boot=root/"boot";boot.mkdir()
+                kernels=["vmlinuz-linux","initramfs-linux.img","vmlinuz-6.18.1-300.fc43.x86_64",
+                         "initramfs-6.18.1-300.fc43.x86_64.img","initrd.img-6.12-generic"]
+                kernels += [f'vmlinuz-{index}-fixture' for index in range(80)]
+                for name in [*kernels,"custom-data"]:(boot/name).write_bytes(name.encode())
+                (boot/"efi/EFI/OtherOS").mkdir(parents=True)
+                (boot/"efi/EFI/OtherOS/loader.efi").write_bytes(b"preserve EFI")
+                (boot/"grub2").mkdir();(boot/"grub2/grub.cfg").write_bytes(b"previous boot configuration")
                 before={p.relative_to(boot):p.read_bytes() for p in boot.rglob("*") if p.is_file()}
-                self.invoke("clear-kernels",root,success=not invalid)
+                env={"CENERE_TEST_RSYNC_FAIL":"1"} if failure else None
+                self.invoke("preserve-boot",root,success=not failure,extra_env=env)
                 after={p.relative_to(boot):p.read_bytes() for p in boot.rglob("*") if p.is_file()}
-                expected=before if invalid else {p:v for p,v in before.items() if str(p) not in names}
+                expected=before if failure else {p:v for p,v in before.items() if str(p) not in kernels}
                 self.assertEqual(after,expected)
+                if not failure:
+                    saved={p.relative_to(root/"backup"):p.read_bytes() for p in (root/"backup").rglob("*") if p.is_file()}
+                    self.assertEqual(saved,{p:v for p,v in before.items() if p.parts[0]!="efi"})
+                    self.invoke("preserve-boot",root,success=False)
+                    self.assertEqual(after,{p.relative_to(boot):p.read_bytes() for p in boot.rglob("*") if p.is_file()})
 
     def test_valid_package_contract_retains_shared_dependency(self):
         root, _ = self.manifest()

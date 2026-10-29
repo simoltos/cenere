@@ -37,6 +37,7 @@ static char stage[128];
 static char work[64];
 static bool mounted_root, mounted_home, mounted_boot, mounted_efi;
 static bool root_open, probe_open, top_mounted;
+static char probe_device[PATH_MAX];
 static int flush_fds[4] = {-1, -1, -1, -1};
 static int log_fd = -1;
 static char log_path[PATH_MAX];
@@ -147,11 +148,11 @@ struct partition {
 struct storage {
     struct partition parts[MAX_PARTS];
     size_t count;
-    uint64_t bytes, sector, first, last, payload, home_used;
+    uint64_t bytes, sector, first, last, payload, home_used, boot_used;
     int home, esp, bios, root, boot, shrink, source_home, old_boot;
-    bool btrfs_home, encrypted_home, reuse_btrfs, arch_btrfs;
-    char root_subvol[32], home_subvol[32];
-    uint64_t root_id, home_id, btrfs_available;
+    bool encrypted_home, reuse_btrfs, home_measured;
+    char root_subvol[256], home_subvol[256];
+    uint64_t root_id, home_id, system_available;
     uint64_t shrink_size;
     bool gpt, inline_home, ambiguous_home;
     char serial[256], raw_fs[32], table[32768];
@@ -290,6 +291,33 @@ static uint64_t number(json_object *object, const char *key)
                                                                    : 0;
 }
 
+struct scan_progress {
+    uint64_t entries, bytes, value;
+    bool digits, path, invalid;
+};
+
+/* du's NUL-delimited records handle arbitrary filenames. Only counts reach
+ * the UI/log; directory totals are not added to their children's sizes. */
+static void scan_feed(struct scan_progress *scan, const char *data, size_t length)
+{
+    for (size_t i=0; i<length; i++) {
+        unsigned char ch=(unsigned char)data[i];
+        if (!ch) {
+            if (!scan->path || !scan->digits) scan->invalid=true;
+            scan->bytes=scan->value;
+            scan->entries++;
+            scan->value=0;
+            scan->path=scan->digits=false;
+        } else if (!scan->path) {
+            if (ch=='\t' && scan->digits) scan->path=true;
+            else if (ch>='0' && ch<='9' && scan->value<=(UINT64_MAX-(ch-'0'))/10) {
+                scan->value=scan->value*10+(ch-'0');
+                scan->digits=true;
+            } else scan->invalid=true;
+        }
+    }
+}
+
 /* Return the actual exit code. Captured output is bounded and never truncated
  * into a successful parse. Secrets use stdin and are never printed. */
 static int command(const char *const args[], const char *input, char *output, size_t capacity,
@@ -297,8 +325,11 @@ static int command(const char *const args[], const char *input, char *output, si
 {
     int in[2] = {-1, -1}, out[2] = {-1, -1}, err[2] = {-1, -1}, status = 0;
     bool stream = (log_fd >= 0 || progress_callback) && !quiet;
-    bool progress = false;
+    bool progress = false, scanning = false;
     struct transfer_progress transfer = {0};
+    struct scan_progress scan = {0};
+    for (size_t i=0; output && !strcmp(args[0],"/usr/bin/du") && args[i]; i++)
+        if (!strcmp(args[i],"--null")) scanning=true;
     for (size_t i = 0; stream && !output && args[i]; i++)
         if (!strcmp(args[i], "--info=progress2"))
             progress = true;
@@ -396,6 +427,10 @@ static int command(const char *const args[], const char *input, char *output, si
             ssize_t n = read(pipes[i].fd, buffer, sizeof(buffer));
             if (n > 0) {
                 clear_activity();
+                if (i==1 && scanning) {
+                    scan_feed(&scan,buffer,(size_t)n);
+                    continue;
+                }
                 if (i == 1 && progress) {
                     progress_feed(&transfer, buffer, (size_t)n);
                     continue;
@@ -436,7 +471,16 @@ static int command(const char *const args[], const char *input, char *output, si
         clock_gettime(CLOCK_MONOTONIC, &now);
         time_t elapsed = now.tv_sec - started.tv_sec;
         if ((log_fd >= 0 || progress_callback) && !finished && elapsed != last_notice) {
-            if (progress_callback)
+            if (scanning) {
+                char detail[128];
+                snprintf(detail,sizeof(detail),"Checked %llu files and directories",
+                         (unsigned long long)scan.entries);
+                if (progress_callback) report_progress(detail);
+                else if (isatty(STDERR_FILENO)) {
+                    fprintf(stderr,"\r\033[K[Cenere] %s | %s",stage,detail);
+                    fflush(stderr);activity_visible=true;
+                }
+            } else if (progress_callback)
                 report_progress(NULL);
             else if (isatty(STDERR_FILENO) && !(progress && transfer.on_screen)) {
                 fprintf(stderr,"\r\033[K[Cenere] %s | %ld:%02ld elapsed",stage,
@@ -458,6 +502,18 @@ static int command(const char *const args[], const char *input, char *output, si
         while (waitpid(child, &status, 0) < 0 && errno == EINTR) {
         }
     clear_activity();
+    if (scanning) {
+        if (!scan.entries || scan.path || scan.digits || scan.invalid) overflow=true;
+        int n=snprintf(output,capacity,"%llu\n",(unsigned long long)scan.bytes);
+        if (n<0 || (size_t)n>=capacity) overflow=true;
+        else used=(size_t)n;
+        char detail[128];
+        snprintf(detail,sizeof(detail),"Checked %llu files and directories",
+                 (unsigned long long)scan.entries);
+        report_progress(detail);
+        if (log_fd>=0) dprintf(log_fd,"%s; measured %llu bytes\n",detail,
+                              (unsigned long long)scan.bytes);
+    }
     report_progress(NULL);
     if (output)
         output[used] = '\0';
@@ -984,15 +1040,24 @@ bool cenere_apply_keyboard(struct installation_plan *plan)
     return true;
 }
 
-static uint64_t tree_size(const char *path)
+static uint64_t scan_size(const char *path, bool one_filesystem)
 {
-    char output[256];
-    if (READ(output, "/usr/bin/du", "-sx", "--block-size=1", path) != 0)
+    char output[64];
+    const char *args[8]={"/usr/bin/du","--all","--null","--block-size=1"};
+    size_t count=4;
+    if (one_filesystem) args[count++]="--one-file-system";
+    args[count++]="--";args[count++]=path;args[count]=NULL;
+    if (command(args,NULL,output,sizeof(output),false) != 0)
         return UINT64_MAX;
     char *end;
     errno = 0;
     uint64_t n = strtoull(output, &end, 10);
     return !errno && end != output ? n : UINT64_MAX;
+}
+
+static uint64_t tree_size(const char *path)
+{
+    return scan_size(path,true);
 }
 
 static uint64_t payload_size(const char *path)
@@ -1013,6 +1078,7 @@ static uint64_t payload_size(const char *path)
         identity.stx_dev_major == cached.stx_dev_major &&
         identity.stx_dev_minor == cached.stx_dev_minor)
         return size;
+    set_stage("Measuring the prepared installation image");
     uint64_t measured = tree_size(path);
     if (immutable && measured != UINT64_MAX) {
         snprintf(cached_path, sizeof(cached_path), "%s", path);
@@ -1044,25 +1110,39 @@ static bool close_probe(const char *probe, bool mounted)
     bool ok = !mounted || RUN("/usr/bin/umount", probe) == 0;
     if (probe_open && ok) {
         ok = RUN("/usr/bin/cryptsetup", "close", "cenere-probe") == 0;
-        if (ok)
+        if (ok) {
             probe_open = false;
+            probe_device[0]='\0';
+        }
     }
     return ok || error("Cannot close the read-only storage inspection");
+}
+
+static const char *probe_block(const struct partition *p, const struct installation_plan *plan)
+{
+    if (strcmp(p->fs,"crypto_LUKS")) return p->device;
+    if (probe_open) {
+        if (!strcmp(probe_device,p->device)) return "/dev/mapper/cenere-probe";
+        error("Another encrypted inspection is still open");return NULL;
+    }
+    if (!*plan->existing_password) {
+        error("The existing disk password is required for preservation");return NULL;
+    }
+    set_stage("Unlocking %s for read-only inspection",p->device);
+    if (!run((const char *const[]){"/usr/bin/cryptsetup", "open", "--readonly",
+                "--key-file", "-", p->device, "cenere-probe", NULL}, plan->existing_password))
+        {error("Cannot unlock the existing storage for read-only inspection");return NULL;}
+    probe_open = true;
+    snprintf(probe_device,sizeof(probe_device),"%s",p->device);
+    return "/dev/mapper/cenere-probe";
 }
 
 static bool mount_probe(const struct partition *p, const struct installation_plan *plan,
                         const char *probe, const char *type, const char *options)
 {
-    const char *device = p->device;
-    if (!strcmp(p->fs, "crypto_LUKS")) {
-        if (probe_open || !*plan->existing_password)
-            return error("The existing disk password is required for preservation");
-        if (!run((const char *const[]){"/usr/bin/cryptsetup", "open", "--readonly",
-                    "--key-file", "-", device, "cenere-probe", NULL}, plan->existing_password))
-            return error("Cannot unlock the existing storage for read-only inspection");
-        probe_open = true;
-        device = "/dev/mapper/cenere-probe";
-    }
+    const char *device=probe_block(p,plan);
+    if (!device) return false;
+    set_stage("Inspecting the filesystem on %s",p->device);
     if (!strcmp(type, "btrfs")) {
         char super[16384];
         if (READ(super, "/usr/bin/btrfs", "inspect-internal", "dump-super", device)) {
@@ -1102,12 +1182,27 @@ static bool subvolume_id(const char *path, uint64_t *id)
     return !errno && *id > 5 && end != output && !*end;
 }
 
+static bool subvolume_name(const char *name)
+{
+    return *name && strlen(name)<256 && strcmp(name,".") && strcmp(name,"..") &&
+           strspn(name,"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789@._+-")==strlen(name);
+}
+
 static bool discover_btrfs(struct storage *s, struct installation_plan *plan,
                            size_t index, const char *probe)
 {
     const struct partition *p = &s->parts[index];
     if (!mount_probe(p, plan, probe, "btrfs", "ro,rescue=nologreplay,subvolid=5"))
         return false;
+    for (const char **name=(const char *[]){"@cenere-previous",".cenere-boot-backup",NULL}; *name; name++) {
+        char path[PATH_MAX]; struct stat previous;
+        snprintf(path,sizeof(path),"%s/%s",probe,*name);
+        if (!lstat(path,&previous)) {
+            close_probe(probe,true);
+            return error("A previous interrupted installation requires recovery before reinstalling (%s)",*name);
+        }
+        if (errno!=ENOENT) { close_probe(probe,true); return error("Cannot inspect previous installation state"); }
+    }
     bool ok = true, recognized = false;
     int fd=open(probe,O_RDONLY|O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW);
     struct btrfs_ioctl_fs_info_args info={0};
@@ -1117,20 +1212,32 @@ static bool discover_btrfs(struct storage *s, struct installation_plan *plan,
         return error("Preservation requires a single-device Btrfs filesystem");
     }
     close(fd);
-    const char *roots[] = {"@", "root", NULL};
-    for (size_t i = 0; roots[i]; i++) {
+    DIR *roots=opendir(probe);
+    if (!roots) { close_probe(probe,true); return error("Cannot list Btrfs subvolumes"); }
+    struct dirent *candidate;
+    while ((candidate=readdir(roots))) {
+        const char *root_name=candidate->d_name;
+        if (!subvolume_name(root_name)) continue;
         char path[PATH_MAX], line[1024];
-        uint64_t root_id, home_id;
-        snprintf(path, sizeof(path), "%s/%s", probe, roots[i]);
+        uint64_t root_id, home_id=0;
+        snprintf(path, sizeof(path), "%s/%s", probe, root_name);
         if (!subvolume_id(path, &root_id))
             continue;
-        snprintf(path, sizeof(path), "%s/%s/etc/fstab", probe, roots[i]);
+        snprintf(path, sizeof(path), "%s/%s/etc/fstab", probe, root_name);
+        char resolved[PATH_MAX];
+        if (!realpath(path,resolved) || strncmp(resolved,probe,strlen(probe)) || resolved[strlen(probe)]!='/') continue;
         FILE *file = fopen(path, "r");
         if (!file)
             continue;
-        char home_name[32] = "";
+        char home_name[256] = "", uuid_value[128];
         int old_boot = -1;
-        bool matching_root = false;
+        bool matching_root = false, home_entry=false, inline_home=false;
+        const char *block = probe_open ? "/dev/mapper/cenere-probe" : p->device;
+        if (READ(uuid_value,"/usr/bin/blkid","-s","UUID","-o","value",block)) {
+            fclose(file); ok=error("Cannot identify the inspected Btrfs filesystem"); break;
+        }
+        trim(uuid_value);
+        set_stage("Reading system and home layout on %s",p->device);
         while (fgets(line, sizeof(line), file)) {
             char device[256], point[128], type[32], options[512];
             if (line[0] == '#' || sscanf(line, "%255s %127s %31s %511s",
@@ -1141,76 +1248,66 @@ static bool discover_btrfs(struct storage *s, struct installation_plan *plan,
                     strcmp(s->parts[old_boot].fs, "ext4"))
                     old_boot = -1;
             }
+            if (!strcmp(point,"/home")) home_entry=true;
             if (strcmp(type, "btrfs") || (strcmp(point, "/home") && strcmp(point, "/")))
                 continue;
-            char uuid_value[128];
-            const char *block = probe_open ? "/dev/mapper/cenere-probe" : p->device;
-            if (READ(uuid_value, "/usr/bin/blkid", "-s", "UUID", "-o", "value", block))
-                continue;
-            trim(uuid_value);
             if (strncmp(device, "UUID=", 5) || strcmp(device + 5, uuid_value))
                 continue;
             for (char *option = strtok(options, ","); option; option = strtok(NULL, ",")) {
+                if (!strcmp(point,"/") && !strncmp(option,"subvolid=",9)) {
+                    char *end;errno=0;
+                    uint64_t id=strtoull(option+9,&end,10);
+                    if (!errno && end!=option+9 && !*end && id==root_id) matching_root=true;
+                }
                 if (strncmp(option, "subvol=", 7))
                     continue;
                 const char *name = option + 7;
                 if (*name == '/')
                     name++;
-                if (!strcmp(point, "/") && !strcmp(name, roots[i]))
+                if (!strcmp(point, "/") && !strcmp(name, root_name))
                     matching_root = true;
-                if (!strcmp(point, "/home") && (!strcmp(name, "@home") || !strcmp(name, "home")))
+                if (!strcmp(point, "/home") && subvolume_name(name))
                     snprintf(home_name, sizeof(home_name), "%s", name);
             }
         }
         fclose(file);
-        if (!matching_root || !*home_name || old_boot < 0)
-            continue;
-        snprintf(path, sizeof(path), "%s/%s", probe, home_name);
-        if (!subvolume_id(path, &home_id))
-            continue;
+        if (!matching_root) continue;
+        if (*home_name) {
+            snprintf(path,sizeof(path),"%s/%s",probe,home_name);
+            if (!subvolume_id(path,&home_id) || home_id==root_id) continue;
+        } else {
+            if (home_entry) continue;
+            snprintf(path,sizeof(path),"%s/%s/home",probe,root_name);
+            struct stat home;
+            if (lstat(path,&home) || !S_ISDIR(home.st_mode)) continue;
+            inline_home=true;
+            snprintf(home_name,sizeof(home_name),"%s",root_name);
+        }
         recognized = true;
         if (s->home >= 0) {
             s->ambiguous_home = true;
             continue;
         }
         s->home = (int)index;
-        s->btrfs_home = true;
+        s->inline_home=inline_home;
         s->encrypted_home = !strcmp(p->fs, "crypto_LUKS");
         s->old_boot = old_boot;
         s->root_id = root_id;
         s->home_id = home_id;
-        snprintf(s->root_subvol, sizeof(s->root_subvol), "%s", roots[i]);
+        snprintf(s->root_subvol, sizeof(s->root_subvol), "%s", root_name);
         snprintf(s->home_subvol, sizeof(s->home_subvol), "%s", home_name);
-        char size_text[128], *end;
-        if (READ(size_text,"/usr/bin/du","-s","--block-size=1",path)) {
-            ok=error("Cannot measure the Btrfs home"); break;
-        }
-        errno=0; s->home_used=strtoull(size_text,&end,10);
-        if (errno || end==size_text) { ok=error("Invalid Btrfs home size"); break; }
-        snprintf(path,sizeof(path),"%s/%s/usr/bin/pacman",probe,roots[i]);
-        s->arch_btrfs=access(path,X_OK)==0;
-        snprintf(path,sizeof(path),"%s/%s/usr/bin/mkinitcpio",probe,roots[i]);
-        s->arch_btrfs=s->arch_btrfs && access(path,X_OK)==0;
-        if (s->arch_btrfs) {
-            snprintf(path,sizeof(path),"%s/%s",probe,roots[i]);
-            if (!kernel_images(path,false)) {ok=false;break;}
-        }
-        snprintf(path,sizeof(path),"%s/@cenere-previous",probe);
-        struct stat previous;
-        if (!lstat(path,&previous)) {
-            ok=error("A previous interrupted Btrfs installation requires recovery before reinstalling"); break;
-        }
         struct statvfs fs;
-        if (s->home_used == UINT64_MAX || statvfs(probe, &fs)) {
+        if (statvfs(probe, &fs)) {
             ok = error("Cannot measure the existing Btrfs filesystem");
             break;
         }
-        s->btrfs_available = (uint64_t)fs.f_bavail * fs.f_frsize;
+        s->system_available = (uint64_t)fs.f_bavail * fs.f_frsize;
         size_t used = strlen(plan->systems);
         snprintf(plan->systems + used, sizeof(plan->systems) - used,
                  "%sBtrfs system (%s, subvolumes %s and %s)", used ? "; " : "",
-                 p->device, roots[i], home_name);
+                 p->device, root_name, home_name);
     }
+    closedir(roots);
     /* Unknown Btrfs layouts may contain home data too. Offer preservation and
      * refuse it safely instead of omitting that choice on an unsupported layout. */
     if (ok && !recognized)
@@ -1222,105 +1319,70 @@ static bool mount_preserved_home(const struct storage *s, const struct installat
                                  const char *probe)
 {
     const struct partition *p = &s->parts[s->source_home];
-    char options[128];
+    char options[384];
     snprintf(options, sizeof(options), "ro,rescue=nologreplay,subvol=%s", s->home_subvol);
-    return mount_probe(p, plan, probe, s->btrfs_home ? "btrfs" : "ext4",
-                       s->btrfs_home ? options : "ro,noload");
+    return mount_probe(p, plan, probe, "btrfs", options);
+}
+
+static void preserved_home_path(const struct storage *s, const char *probe, char *path, size_t size)
+{
+    snprintf(path,size,"%s%s",probe,s->inline_home ? "/home" : "");
 }
 
 static bool discover(struct storage *s, struct installation_plan *plan)
 {
-    if (!workspace())
-        return false;
+    if (!workspace()) return false;
     char probe[128];
     snprintf(probe, sizeof(probe), "%s/probe", work);
     plan->systems[0] = '\0';
     plan->existing_home = false;
     plan->locked_storage = false;
+    plan->existing_encryption = false;
+    bool other_data = false;
     for (size_t i = 0; i < s->count; i++) {
         struct partition *p = &s->parts[i];
+        if (!strcmp(p->fs, "crypto_LUKS")) plan->existing_encryption = true;
         if (!strcmp(p->fs, "crypto_LUKS") && !*plan->existing_password) {
             plan->locked_storage = true;
             continue;
         }
-        if (!strcmp(p->fs, "btrfs") || !strcmp(p->fs, "crypto_LUKS")) {
-            if (!discover_btrfs(s, plan, i, probe))
-                return false;
-            continue;
-        }
-        if (strcmp(p->fs, "ext4"))
-            continue;
-        if (RUN("/usr/bin/mount", "-t", "ext4", "-o", "ro,noload", p->device, probe) != 0)
-            continue; /* The partition still appears as data in the review. */
-        char file[PATH_MAX], line[512], name[256] = "";
-        snprintf(file, sizeof(file), "%s/etc/os-release", probe);
-        FILE *f = fopen(file, "r");
-        if (f) {
-            while (fgets(line, sizeof(line), f))
-                if (!strncmp(line, "PRETTY_NAME=", 12) || (!*name && !strncmp(line, "ID=", 3))) {
-                    char *value = strchr(line, '=') + 1;
-                    trim(value);
-                    if (*value == '"' || *value == '\'') {
-                        value++;
-                        value[strcspn(value, "\"'")] = '\0';
-                    }
-                    snprintf(name, sizeof(name), "%s", value);
-                }
-            fclose(f);
-        }
-        if (*name) {
-            size_t used = strlen(plan->systems);
-            snprintf(plan->systems + used, sizeof(plan->systems) - used, "%s%s (%s)",
-                     used ? "; " : "", name, p->device);
-            snprintf(file, sizeof(file), "%s/etc/fstab", probe);
-            f = fopen(file, "r");
-            int home = -1;
-            if (f) {
-                while (fgets(line, sizeof(line), f)) {
-                    char source[256], mountpoint[256], fs[32];
-                    if (line[0] == '#')
-                        continue;
-                    if (sscanf(line, "%255s %255s %31s", source, mountpoint, fs) == 3 &&
-                        !strcmp(mountpoint, "/home")) {
-                        if (!strcmp(fs, "ext4") && resolve_partition(s, source, &home) &&
-                            !strcmp(s->parts[home].fs, "ext4")) {
-                            if (s->home >= 0 && s->home != home)
-                                s->ambiguous_home = true;
-                            s->home = home;
-                        } else
-                            s->ambiguous_home = true;
-                    }
-                }
-                fclose(f);
+        char inner_fs[64];
+        const char *type = p->fs;
+        if (!strcmp(type, "crypto_LUKS")) {
+            const char *device = probe_block(p, plan);
+            if (!device) return false;
+            if (READ(inner_fs, "/usr/bin/blkid", "--probe", "-s", "TYPE", "-o", "value", device)) {
+                close_probe(probe, false);
+                return error("Cannot identify the unlocked filesystem");
             }
-            if (home < 0 && !s->ambiguous_home) {
-                snprintf(file, sizeof(file), "%s/home", probe);
-                DIR *dir = opendir(file);
-                if (dir) {
-                    struct dirent *entry;
-                    while ((entry = readdir(dir)))
-                        if (entry->d_name[0] != '.')
-                            s->inline_home = true;
-                    closedir(dir);
-                }
-            }
+            trim(inner_fs);
+            type = inner_fs;
         }
-        if (RUN("/usr/bin/umount", probe) != 0)
-            return error("Cannot unmount discovery filesystem");
+        if (!strcmp(type, "btrfs")) {
+            if (!discover_btrfs(s, plan, i, probe)) return false;
+        } else {
+            /* Unsupported data must not disappear from the preservation review.
+             * Boot/EFI and swap are not candidate homes. Other filesystems are
+             * only inspected by the separate coexistence shrink path. */
+            if (*type && strcmp(type, "swap") && (int)i != s->esp && (int)i != s->bios)
+                other_data = true;
+            if (probe_open && !close_probe(probe, false)) return false;
+        }
     }
-    if (s->home >= 0 && !s->btrfs_home) {
-        if (RUN("/usr/bin/mount", "-t", "ext4", "-o", "ro,noload", s->parts[s->home].device,
-                probe) != 0)
-            return error("Cannot inspect the existing home read-only");
-        s->home_used = tree_size(probe);
-        int result = RUN("/usr/bin/umount", probe);
-        if (result || s->home_used == UINT64_MAX)
-            return error("Cannot measure the existing home");
-        plan->existing_home = true;
-    } else if (s->btrfs_home || s->inline_home || s->ambiguous_home || plan->locked_storage)
-        plan->existing_home = true;
+    plan->existing_home = s->home >= 0 || s->ambiguous_home || plan->locked_storage || other_data;
     s->source_home = s->home;
-    plan->existing_encryption = s->encrypted_home;
+    if (plan->preserve_home && s->home >= 0 && !s->inline_home && !plan->alongside &&
+        plan->encrypt == s->encrypted_home && s->old_boot >= 0) {
+        set_stage("Checking the existing boot filesystem");
+        if (RUN("/usr/bin/mount", "-t", "ext4", "-o", "ro,noload", s->parts[s->old_boot].device, probe))
+            return error("Cannot inspect the existing boot filesystem read-only");
+        struct statvfs fs;
+        bool measured = statvfs(probe, &fs) == 0;
+        if (measured) s->boot_used = ((uint64_t)fs.f_blocks - fs.f_bfree) * fs.f_frsize;
+        int closed = RUN("/usr/bin/umount", probe);
+        if (!measured || closed) return error("Cannot measure the existing boot filesystem");
+    }
+    plan->existing_encryption = plan->existing_encryption || s->encrypted_home;
     plan->existing_os = s->count > 0 || *s->raw_fs;
     if (plan->existing_os && !*plan->systems)
         snprintf(plan->systems, sizeof(plan->systems),
@@ -1336,11 +1398,11 @@ bool cenere_inspect(struct installation_plan *plan)
     if (!realpath(plan->target, canonical))
         return error("Cannot resolve destination disk");
     snprintf(plan->target, sizeof(plan->target), "%s", canonical);
+    set_stage("Reading partitions on %s",plan->target);
     if (!read_storage(plan->target, &s, plan->snapshot, sizeof(plan->snapshot)) ||
         !discover(&s, plan) || !find_source(plan))
         return false;
     plan->disk_bytes = s.bytes;
-    plan->existing_encryption=s.encrypted_home;
     return true;
 }
 
@@ -1411,18 +1473,23 @@ static bool plan_storage(struct storage *s, struct installation_plan *plan)
     if (plan->preserve_home && !s->gpt)
         return error("Home preservation on an MBR disk requires a separate backup before "
                      "converting to GPT; no changes made");
-    if (plan->preserve_home && (s->inline_home || s->ambiguous_home || s->home < 0))
-        return error("Preservation requires an identified ext4 home or Btrfs root/home subvolumes; "
+    if (plan->preserve_home && (s->ambiguous_home || s->home < 0))
+        return error("Home preservation requires an identified compatible Btrfs layout; "
                      "this layout cannot be changed safely");
     int old_home = s->source_home;
-    s->reuse_btrfs = plan->preserve_home && s->btrfs_home && s->arch_btrfs && !plan->alongside &&
+    s->reuse_btrfs = plan->preserve_home && !s->inline_home && !plan->alongside &&
                      plan->encrypt == s->encrypted_home;
     plan->reuse_storage = s->reuse_btrfs;
     if (s->reuse_btrfs) {
-        if (s->old_boot < 0 || s->esp < 0 || (strcmp(plan->firmware,"uefi") && s->bios < 0) ||
-            s->btrfs_available < s->payload + 2 * GiB)
-            return error("Btrfs preservation requires existing boot partitions and free space "
-                         "for a new root while retaining the previous root");
+        if (s->old_boot < 0 || s->esp < 0 ||
+            (strcmp(plan->firmware,"uefi") && s->bios < 0))
+            return error("Reusing this filesystem requires an existing EFI partition and an ext4 /boot "
+                         "(and a BIOS boot partition for BIOS mode); no disk changes made");
+        if (s->boot_used>UINT64_MAX-2*GiB || s->payload>UINT64_MAX-s->boot_used-2*GiB ||
+            s->system_available < s->payload+s->boot_used+2*GiB)
+            return error("Not enough free space inside the existing filesystem: %.1f GiB available, %.1f GiB "
+                         "needed for the new system while retaining the old root; the home stays in place",
+                         (double)s->system_available/GiB,((double)s->payload+s->boot_used)/GiB+2);
         for (size_t i = 0; i < s->count; i++)
             s->parts[i].keep = true;
         s->root = s->home = old_home;
@@ -1431,11 +1498,23 @@ static bool plan_storage(struct storage *s, struct installation_plan *plan)
                  "\n  KEEP all partitions and existing encryption settings\n"
                  "  REPLACE root subvolume %s on %s (ID %llu)\n"
                  "  KEEP home subvolume %s (ID %llu); root/home share free space\n"
-                 "  KEEP boot filesystem %s; update system boot files\n",
+                 "  KEEP boot filesystem %s; preserve old boot files until verification\n",
                  s->root_subvol, s->parts[s->root].device, (unsigned long long)s->root_id,
                  s->home_subvol, (unsigned long long)s->home_id, s->parts[s->boot].device);
         return true;
     }
+    if (plan->preserve_home && !s->home_measured) {
+        char probe[128], path[256];
+        snprintf(probe,sizeof(probe),"%s/probe",work);
+        if (!mount_preserved_home(s,plan,probe)) return false;
+        preserved_home_path(s,probe,path,sizeof(path));
+        set_stage("Measuring home contents for a verified copy");
+        s->home_used=scan_size(path,false);
+        bool closed=close_probe(probe,true);
+        if (s->home_used==UINT64_MAX || !closed) return error("Cannot measure the home to copy");
+        s->home_measured=true;
+    }
+    set_stage("Checking space for the selected storage layout");
     if (!plan->preserve_home || old_home < 0)
         s->home = -1;
     for (size_t i = 0; i < s->count; i++)
@@ -1447,12 +1526,17 @@ static bool plan_storage(struct storage *s, struct installation_plan *plan)
         s->first = MiB / s->sector;
         s->last = s->bytes / s->sector - 34;
     }
+    if (s->payload>(UINT64_MAX-4*GiB)/2) return error("Installation image size is too large");
     uint64_t minimum_root = s->payload + s->payload / 2 + 4 * GiB;
     if (minimum_root < 16 * GiB)
         minimum_root = 16 * GiB;
-    if (plan->preserve_home)
+    if (plan->preserve_home) {
+        if (s->home_used>UINT64_MAX-minimum_root-2*GiB)
+            return error("Preserved home size is too large");
         minimum_root += s->home_used + 2 * GiB;
+    }
     uint64_t overhead = 2 * GiB + (s->esp < 0 ? 512 * MiB : 0) + (s->bios < 0 ? MiB : 0);
+    if (minimum_root>UINT64_MAX-overhead) return error("Required storage size is too large");
     uint64_t required = minimum_root + overhead;
     uint64_t start, size;
     free_extent(s, &start, &size);
@@ -1499,9 +1583,15 @@ static bool plan_storage(struct storage *s, struct installation_plan *plan)
             break;
         }
     }
-    if (size * s->sector < required)
-        return error("Not enough safely usable space: need at least %.1f GiB; no disk changes made",
-                     (double)required / GiB);
+    if (size * s->sector < required) {
+        if (plan->preserve_home)
+            return error("Keeping this home requires a new filesystem and a verified copy: "
+                         "%.1f GiB available outside its original partition, %.1f GiB needed. "
+                         "Space inside the preserved partition cannot be used for this copy; no disk changes made",
+                         (double)size*s->sector/GiB,(double)required/GiB);
+        return error("Not enough safely usable space: %.1f GiB available, %.1f GiB needed; no disk changes made",
+                     (double)size*s->sector/GiB,(double)required/GiB);
+    }
     uint64_t cursor = start;
     if (s->bios < 0) {
         s->bios = append_partition(s, plan->target, cursor, MiB / s->sector, BIOS_TYPE);
@@ -1549,16 +1639,29 @@ static bool plan_storage(struct storage *s, struct installation_plan *plan)
 static bool kernel_images(const char *, bool);
 static bool configuration_preflight(const struct storage *, const struct installation_plan *);
 
-bool cenere_preflight(struct installation_plan *plan)
+static bool storage_preflight(struct storage *s, struct installation_plan *plan)
 {
-    set_stage("Checking the installation plan and available disk space");
-    struct storage s;
+    set_stage("Reading the selected disk and available space");
     char snapshot[65536];
-    if (!read_storage(plan->target, &s, snapshot, sizeof(snapshot)))
+    if (!read_storage(plan->target, s, snapshot, sizeof(snapshot)))
         return false;
     if (strcmp(snapshot, plan->snapshot))
         return error("Disk identity or layout changed after selection; select it again");
-    if (!discover(&s, plan) || !image_source(plan->source,plan) || !plan_storage(&s, plan) ||
+    return discover(s,plan) && image_source(plan->source,plan) && plan_storage(s,plan);
+}
+
+bool cenere_check_storage(struct installation_plan *plan)
+{
+    struct storage s;
+    problem[0]='\0';
+    return storage_preflight(&s,plan);
+}
+
+bool cenere_preflight(struct installation_plan *plan)
+{
+    struct storage s;
+    problem[0]='\0';
+    if (!storage_preflight(&s,plan) ||
         !kernel_images(plan->source, false) || !configuration_preflight(&s, plan))
         return false;
     const char *tools[] = {
@@ -1654,7 +1757,7 @@ static bool mount_fs(const char *device, const char *path, const char *type, boo
 static bool mount_subvolume(const char *device, const char *path, const char *subvolume,
                             bool *flag)
 {
-    char options[128];
+    char options[384];
     snprintf(options,sizeof(options),"noatime,compress=zstd:3,subvol=%s",subvolume);
     if (!directory(path) || !DO("/usr/bin/mount","-t","btrfs","-o",options,device,path)) return false;
     *flag=true;
@@ -1668,7 +1771,9 @@ static bool flush_filesystem(int index)
                ? true
                : error("Filesystem writeback failed during %s: %s", stage, strerror(errno));
 }
-static bool copy_tree(const char *source, const char *target, bool verify, bool home)
+enum copy_kind { SYSTEM_TREE, HOME_TREE, BOOT_TREE };
+
+static bool copy_tree(const char *source, const char *target, bool verify, enum copy_kind kind)
 {
     char from[PATH_MAX + 2], to[PATH_MAX + 2], diff[4096];
     snprintf(from, sizeof(from), "%s/", source);
@@ -1676,7 +1781,7 @@ static bool copy_tree(const char *source, const char *target, bool verify, bool 
     const char *args[40];
     size_t n = 0;
     args[n++] = "/usr/bin/rsync";
-    args[n++] = home ? "-aHAXS" : "-aHAXSx";
+    args[n++] = kind==HOME_TREE ? "-aHAXS" : "-aHAXSx";
     args[n++] = "--numeric-ids";
     if (verify) {
         args[n++] = "--checksum";
@@ -1688,8 +1793,13 @@ static bool copy_tree(const char *source, const char *target, bool verify, bool 
         args[n++] = "--human-readable";
         args[n++] = "--no-inc-recursive";
     }
-    if (!home) {
+    if (kind==BOOT_TREE) {
+        args[n++]="--exclude";
+        args[n++]="/efi/***";
+    } else if (kind==SYSTEM_TREE) {
         static const char *excluded[] = {"/home/***",
+                                         "/.cenere-previous/***",
+                                         "/.cenere-boot-backup/***",
                                          "/dev/***",
                                          "/proc/***",
                                          "/sys/***",
@@ -1711,7 +1821,7 @@ static bool copy_tree(const char *source, const char *target, bool verify, bool 
     args[n] = NULL;
     int code = command(args, NULL, verify ? diff : NULL, sizeof(diff), false);
     return (code == 0 && (!verify || !*diff)) ||
-           error("%s %s failed during %s%s", home ? "Home" : "System",
+           error("%s %s failed during %s%s", kind==HOME_TREE ? "Home" : kind==BOOT_TREE ? "Boot files" : "System",
                  verify ? "verification" : "transfer", stage,
                  verify && code == 0 ? ": contents or metadata differ" : "");
 }
@@ -2112,42 +2222,48 @@ static bool verify_initramfs(const struct installation_plan *plan, const char *t
     return ok && (count>0 || error("No generated initramfs was verified"));
 }
 
-/* A reused /boot must not offer kernels belonging to the replaced root.
- * Use the old root's validated package metadata, never a broad /boot deletion:
- * other loaders, EFI files and unrelated boot material remain intact. */
-static bool clear_previous_kernels(const char *previous, const char *target)
+/* Preserve the complete old boot tree before retiring Linux kernel filenames.
+ * This uses the boot layout, not the old distribution's package manager.
+ * EFI loaders and unrelated boot files stay in place. */
+static bool preserve_boot_files(const char *boot, const char *backup)
 {
-    if (!kernel_images(previous,false)) return false;
-    char path[PATH_MAX+512];
-    snprintf(path,sizeof(path),"%s/usr/lib/modules",previous);
-    DIR *dir=opendir(path);
-    if (!dir) return error("Cannot inspect the previous kernel packages");
+    set_stage("Preserving existing boot files");
+    if (mkdir(backup,0700)) return error("Cannot create the boot recovery directory");
+    if (!copy_tree(boot,backup,false,BOOT_TREE) || !copy_tree(boot,backup,true,BOOT_TREE)) return false;
+    int saved=open(backup,O_RDONLY|O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW);
+    bool durable=saved>=0 && syncfs(saved)==0;
+    if (saved>=0) close(saved);
+    if (!durable) return error("Cannot flush preserved boot files");
+    DIR *dir=opendir(backup);
+    if (!dir) return error("Cannot inspect existing boot files");
+    int boot_fd=open(boot,O_RDONLY|O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW);
+    if (boot_fd<0) {closedir(dir);return error("Cannot open the boot filesystem");}
     struct dirent *entry; bool ok=true;
-    while (ok && (entry=readdir(dir))) {
-        if (entry->d_name[0]=='.') continue;
-        snprintf(path,sizeof(path),"%s/usr/lib/modules/%s/pkgbase",previous,entry->d_name);
-        FILE *file=fopen(path,"r");
-        if (!file) continue;
-        char base[128]=""; bool have=fgets(base,sizeof(base),file)!=NULL && fgetc(file)==EOF && !ferror(file);
-        fclose(file); trim(base);
-        if (!have || !*base || strspn(base,"abcdefghijklmnopqrstuvwxyz0123456789-_")!=strlen(base)) {
-            ok=error("Invalid previous kernel package name"); break;
-        }
-        const char *patterns[]={"vmlinuz-%s","initramfs-%s.img","initramfs-%s-fallback.img"};
-        for (size_t i=0;i<sizeof(patterns)/sizeof(patterns[0]);i++) {
-            char name[192];snprintf(name,sizeof(name),patterns[i],base);
-            snprintf(path,sizeof(path),"%s/boot/%s",target,name);
-            if (unlink(path) && errno!=ENOENT) {
-                ok=error("Cannot replace the previous kernel boot file: %s",name); break;
-            }
-        }
+    while (ok) {
+        errno=0;entry=readdir(dir);
+        if (!entry) {if (errno) ok=error("Cannot read preserved boot files");break;}
+        const char *name=entry->d_name;
+        bool kernel=!strcmp(name,"vmlinuz") || !strncmp(name,"vmlinuz-",8) ||
+                    !strcmp(name,"vmlinux") || !strncmp(name,"vmlinux-",8) ||
+                    !strcmp(name,"bzImage") || !strncmp(name,"kernel-",7);
+        bool initrd=!strcmp(name,"initrd") || !strcmp(name,"initrd.img") ||
+                    !strncmp(name,"initrd-",7) || !strncmp(name,"initrd.img-",11) ||
+                    !strncmp(name,"initramfs-",10);
+        if (!kernel && !initrd) continue;
+        struct stat st;
+        if (fstatat(boot_fd,name,&st,AT_SYMLINK_NOFOLLOW)) {ok=error("Cannot inspect old boot file %s",name);break;}
+        if (!S_ISREG(st.st_mode) && !S_ISLNK(st.st_mode)) continue;
+        if (unlinkat(boot_fd,name,0)) ok=error("Cannot retire old boot file %s",name);
     }
+    if (ok && syncfs(boot_fd)) ok=error("Cannot flush the prepared boot filesystem");
+    close(boot_fd);
     closedir(dir);
     return ok;
 }
 
 static bool configuration_preflight(const struct storage *s, const struct installation_plan *plan)
 {
+    set_stage("Checking account, keyboard and image configuration");
     char path[PATH_MAX + 256], resolved[PATH_MAX], line[512];
     struct installation_plan keyboard=*plan;
     if (!cenere_select_keyboard(&keyboard,plan->keymap,false) ||
@@ -2212,44 +2328,13 @@ static bool configuration_preflight(const struct storage *s, const struct instal
             return error("Chosen username conflicts with a system account/group");
     }
     if (plan->preserve_home) {
-        const char *device = s->parts[s->source_home].device;
-        if (!s->btrfs_home) {
-        char header[8192];
-        if (READ(header, "/usr/bin/dumpe2fs", "-h", device) != 0)
-            return error("Cannot inspect the home journal state");
-        char *features = strstr(header, "Filesystem features:"),
-             *state = strstr(header, "Filesystem state:");
-        bool clean = features && state;
-        if (features) {
-            char *end = strchr(features, '\n');
-            if (end)
-                *end = '\0';
-            if (strstr(features, "needs_recovery"))
-                clean = false;
-        }
-        if (state) {
-            state += strlen("Filesystem state:");
-            while (*state == ' ')
-                state++;
-            char *end = strchr(state, '\n');
-            if (end)
-                *end = '\0';
-            if (strcmp(state, "clean"))
-                clean = false;
-        }
-        if (!clean)
-            return error("Existing home has an unclean filesystem or pending journal recovery; no "
-                         "changes made");
-        if (command((const char *const[]){"/usr/bin/e2fsck", "-f", "-n", device, NULL}, NULL, NULL,
-                    0, true) != 0)
-            return error("Existing home needs filesystem recovery/checking before it can be "
-                         "preserved safely");
-        }
         char probe[128];
         snprintf(probe, sizeof(probe), "%s/probe", work);
         if (!mount_preserved_home(s, plan, probe))
             return error("Cannot inspect preserved account ownership");
-        snprintf(path, sizeof(path), "%s/%s", probe, plan->username);
+        char source_home[256];
+        preserved_home_path(s,probe,source_home,sizeof(source_home));
+        snprintf(path, sizeof(path), "%s/%s", source_home, plan->username);
         struct stat st;
         bool present = lstat(path, &st) == 0, valid = true;
         if (s->reuse_btrfs) {
@@ -2303,25 +2388,30 @@ static bool configure_system(const struct storage *s, const struct installation_
     if (symlink("/etc/machine-id", path)) return error("Cannot link D-Bus identity");
     /* Formatting does not itself emit a device-change event. Refresh udev's
      * UUID links and require them to identify the same devices as the probe. */
+    const char *boot_device = s->parts[s->boot].device;
     if (!DO("/usr/bin/udevadm", "trigger", "--action=change", "--settle",
-            s->parts[s->root].device, root_device, s->parts[s->boot].device,
+            s->parts[s->root].device, root_device, home_device, boot_device,
             s->parts[s->esp].device) ||
         !uuid(root_device, "btrfs", root_uuid, sizeof(root_uuid)) ||
         !uuid(home_device, "btrfs", home_uuid, sizeof(home_uuid)) ||
-        !uuid(s->parts[s->boot].device, "ext4", boot_uuid, sizeof(boot_uuid)) ||
+        !uuid(boot_device, "ext4", boot_uuid, sizeof(boot_uuid)) ||
         !uuid(s->parts[s->esp].device, "vfat", efi_uuid, sizeof(efi_uuid)))
         return false;
     set_stage("Configuring filesystems and encryption");
-    const char *root_subvol=s->reuse_btrfs ? s->root_subvol : "@";
-    const char *home_subvol=s->reuse_btrfs ? s->home_subvol : "@home";
-    if (strcmp(root_uuid,home_uuid)) return error("Root and home must share one Btrfs filesystem");
+    const char *root_subvol = s->reuse_btrfs ? s->root_subvol : "@";
+    const char *home_subvol = s->reuse_btrfs ? s->home_subvol : "@home";
+    char root_entry[512], home_entry[512], boot_entry[256];
+    if (strcmp(root_uuid, home_uuid)) return error("Root and home must share one Btrfs filesystem");
+    snprintf(root_entry, sizeof(root_entry), "UUID=%s / btrfs defaults,noatime,compress=zstd:3,subvol=%s 0 0\n",
+             root_uuid, root_subvol);
+    snprintf(home_entry, sizeof(home_entry), "UUID=%s /home btrfs defaults,noatime,compress=zstd:3,subvol=%s 0 0\n",
+             home_uuid, home_subvol);
+    snprintf(boot_entry, sizeof(boot_entry), "UUID=%s /boot ext4 defaults,noatime 0 2\n", boot_uuid);
     if (!FILE_AT("/etc/fstab", 0644,
-                 "# Generated by Cenere; root/home share one Btrfs filesystem.\n"
-                 "UUID=%s / btrfs defaults,noatime,compress=zstd:3,subvol=%s 0 0\n"
-                 "UUID=%s /home btrfs defaults,noatime,compress=zstd:3,subvol=%s 0 0\n"
-                 "UUID=%s /boot ext4 defaults,noatime 0 2\nUUID=%s /boot/efi vfat umask=0077 0 2\n",
-                 root_uuid,root_subvol,home_uuid,home_subvol,boot_uuid,efi_uuid) ||
-        !FILE_AT("/etc/crypttab",0600,"# The shared root/home container is unlocked in the initramfs.\n"))
+                 "# Generated by Cenere from the reviewed storage layout.\n"
+                 "%s%s%sUUID=%s /boot/efi vfat umask=0077 0 2\n",
+                 root_entry,home_entry,boot_entry,efi_uuid) ||
+        !FILE_AT("/etc/crypttab",0600,"# Encrypted root storage is unlocked in the initramfs.\n"))
         return false;
     if (plan->encrypt) {
         if (!uuid(s->parts[s->root].device, "crypto_LUKS", root_luks, sizeof(root_luks)) ||
@@ -2441,11 +2531,6 @@ static bool configure_system(const struct storage *s, const struct installation_
         !TARGET("/usr/bin/gpgconf", "--homedir", "/etc/pacman.d/gnupg", "--kill", "all"))
         return false;
     set_stage("Preparing kernels and boot files");
-    if (s->reuse_btrfs) {
-        char previous[128];
-        snprintf(previous,sizeof(previous),"%s/btrfs/@cenere-previous",work);
-        if (!clear_previous_kernels(previous,target)) return false;
-    }
     if (!kernel_images(target, true) ||
         !TARGET("/usr/bin/mkinitcpio", "-P"))
         return false;
@@ -2457,7 +2542,8 @@ static bool configure_system(const struct storage *s, const struct installation_
         return error("Cannot configure GRUB");
     fprintf(grub, "\n# Cenere installation\nGRUB_DISTRIBUTOR=%s\nGRUB_DISABLE_OS_PROBER=%s\n",
             plan->image_id, plan->alongside ? "false" : "true");
-    fprintf(grub, "GRUB_CMDLINE_LINUX=\"rootflags=subvol=%s", root_subvol);
+    fprintf(grub, "GRUB_CMDLINE_LINUX=\"");
+    fprintf(grub,"rootflags=subvol=%s",root_subvol);
     if (plan->encrypt) fprintf(grub, " rd.luks.name=%s=cenere-root", root_luks);
     fprintf(grub, "\"\n");
     if (fclose(grub))
@@ -2484,7 +2570,7 @@ int cenere_install(const struct installation_plan *given)
     struct installation_plan plan = *given;
     struct storage s;
     char snapshot[65536];
-    char target[128], home[256], boot[256], efi[512], probe[128], backup[256], top[128];
+    char target[128], home[256], boot[256], efi[512], probe[128], backup[256], top[128], boot_backup[256];
     int result = 1;
     bool changed = false;
     int lock = open("/run/cenere.lock", O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
@@ -2505,6 +2591,7 @@ int cenere_install(const struct installation_plan *given)
     snprintf(probe, sizeof(probe), "%s/probe", work);
     snprintf(top, sizeof(top), "%s/btrfs", work);
     snprintf(backup, sizeof(backup), "%s/@cenere-previous", top);
+    snprintf(boot_backup,sizeof(boot_backup),"%s/.cenere-boot-backup",top);
     status_message("4 of 4: Installation | Keyboard > Disk > Preferences > Account > Summary > [Install]");
     set_stage("Rechecking the disk and confirmed installation plan");
     if (!read_storage(plan.target, &s, snapshot, sizeof(snapshot)) ||
@@ -2521,14 +2608,15 @@ int cenere_install(const struct installation_plan *given)
         goto finish;
     }
     changed = true;
-    if (!s.reuse_btrfs && !partition_disk(&s, &plan))
-        goto finish;
-    set_stage("Preparing the shared Btrfs system and home filesystem");
+    bool reuse_root = s.reuse_btrfs;
+    if (!reuse_root && !partition_disk(&s, &plan)) goto finish;
+    set_stage("Preparing the Btrfs system filesystem");
     const char *root_device=s.parts[s.root].device, *home_device=root_device;
-    if (!s.reuse_btrfs && !clear_new_partition(&s.parts[s.root])) goto finish;
+    char root_path[PATH_MAX],home_path[PATH_MAX];
+    if (!reuse_root && !clear_new_partition(&s.parts[s.root])) goto finish;
     if (plan.encrypt) {
-        const char *secret=s.reuse_btrfs ? plan.existing_password : plan.password;
-        if (!encrypt_device(root_device,"cenere-root",secret,!s.reuse_btrfs)) goto finish;
+        const char *secret=reuse_root ? plan.existing_password : plan.password;
+        if (!encrypt_device(root_device,"cenere-root",secret,!reuse_root)) goto finish;
         root_open=true;
         root_device=home_device="/dev/mapper/cenere-root";
     }
@@ -2539,7 +2627,6 @@ int cenere_install(const struct installation_plan *given)
     top_mounted=true;
     const char *root_subvol=s.reuse_btrfs ? s.root_subvol : "@";
     const char *home_subvol=s.reuse_btrfs ? s.home_subvol : "@home";
-    char root_path[256], home_path[256];
     snprintf(root_path,sizeof(root_path),"%s/%s",top,root_subvol);
     snprintf(home_path,sizeof(home_path),"%s/%s",top,home_subvol);
     if (s.reuse_btrfs) {
@@ -2554,21 +2641,24 @@ int cenere_install(const struct installation_plan *given)
     }
     if (!DO("/usr/bin/btrfs","subvolume","create",root_path) ||
         (!s.reuse_btrfs && !DO("/usr/bin/btrfs","subvolume","create",home_path))) goto finish;
-    if (!mount_subvolume(root_device,target,root_subvol,&mounted_root) ||
-        !mount_subvolume(root_device,home,home_subvol,&mounted_home)) goto finish;
-    if (plan.preserve_home && !s.reuse_btrfs) {
+    if (!mount_subvolume(root_device,target,root_subvol,&mounted_root)) goto finish;
+    if (!mount_subvolume(root_device,home,home_subvol,&mounted_home)) goto finish;
+    if (plan.preserve_home && !reuse_root) {
         set_stage("Copying the preserved home into the new shared filesystem");
         if (!mount_preserved_home(&s,&plan,probe)) goto finish;
-        bool copied=copy_tree(probe,home,false,true) && copy_tree(probe,home,true,true);
+        char source_home[256];
+        preserved_home_path(&s,probe,source_home,sizeof(source_home));
+        set_stage("Copying the preserved home into the new shared filesystem");
+        bool copied=copy_tree(source_home,home,false,HOME_TREE) && copy_tree(source_home,home,true,HOME_TREE);
         bool closed=close_probe(probe,true);
         if (!copied || !closed || !flush_filesystem(1)) goto finish;
         status_message("Home copy verified and flushed; the original source partition remains unchanged");
     }
     set_stage("Preparing the boot filesystem");
-    if ((!s.reuse_btrfs && (!clear_new_partition(&s.parts[s.boot]) ||
-                          !DO("/usr/bin/mkfs.ext4", "-F", "-L", "cenere-boot", s.parts[s.boot].device))) ||
-        !mount_fs(s.parts[s.boot].device, boot, "ext4", &mounted_boot))
-        goto finish;
+    if ((!reuse_root && (!clear_new_partition(&s.parts[s.boot]) ||
+         !DO("/usr/bin/mkfs.ext4", "-F", "-L", "cenere-boot", s.parts[s.boot].device))) ||
+        !mount_fs(s.parts[s.boot].device, boot, "ext4", &mounted_boot)) goto finish;
+    if (reuse_root && !preserve_boot_files(boot,boot_backup)) goto finish;
     set_stage("Preparing the EFI system partition");
     if (!*s.parts[s.esp].fs && (!clear_new_partition(&s.parts[s.esp]) ||
                               !DO("/usr/bin/mkfs.fat", "-F", "32", s.parts[s.esp].device)))
@@ -2576,7 +2666,7 @@ int cenere_install(const struct installation_plan *given)
     if (!mount_fs(s.parts[s.esp].device, efi, "vfat", &mounted_efi))
         goto finish;
     set_stage("Copying the prepared system; this can take several minutes");
-    if (!copy_tree(plan.source, target, false, false))
+    if (!copy_tree(plan.source, target, false, SYSTEM_TREE))
         goto finish;
     if (!configure_system(&s, &plan, target, root_device, home_device) ||
         !finish_package_selection(&plan, target) || !verify_initramfs(&plan,target))
@@ -2585,20 +2675,19 @@ int cenere_install(const struct installation_plan *given)
     for (int i = 0; i < 4; i++)
         if (!flush_filesystem(i))
             goto finish;
-    if (s.reuse_btrfs) {
-        if (!DO("/usr/bin/btrfs","subvolume","set-default",root_path)) goto finish;
-        if (!DO("/usr/bin/btrfs","subvolume","delete","--recursive","--commit-after",backup) ||
-            !flush_filesystem(0)) goto finish;
-    }
     status_message("System setup completed; saving the installation log");
-    if (!save_log(target) || !flush_filesystem(0))
-        goto finish;
+    if (!save_log(target) || !flush_filesystem(0)) goto finish;
+    if (s.reuse_btrfs) {
+        if (!DO("/usr/bin/btrfs","subvolume","set-default",root_path) ||
+            !DO("/usr/bin/btrfs","subvolume","delete","--recursive","--commit-after",backup)) goto finish;
+    }
+    if (reuse_root && (!DO("/usr/bin/rm","-rf","--",boot_backup) || !flush_filesystem(0))) goto finish;
     result = 0;
 finish:
     if (result)
         status_message("Installation stopped during %s: %s. %s", stage, problem,
                        changed ? "The target may be partially changed. Preserved source home data was not formatted; "
-                                 "inspect @cenere-previous for any retained prior Btrfs root."
+                                 "inspect the retained previous-root and boot-backup directories for recovery."
                                : "No disk modifications were started.");
     if (result && mounted_root && !save_log(target))
         status_message("The full log remains in the live environment: %s", log_path);

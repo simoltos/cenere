@@ -61,7 +61,8 @@ int main(int argc, char **argv)
     snprintf(stage, sizeof(stage), "Runner regression");
     if (getenv("CENERE_RUNNER_GUI")) cenere_set_progress_callback(progress_sink);
     const char *arguments[] = {argv[1], argv[2], argv[3], argc == 8 ? "--info=progress2" : NULL, NULL};
-    int result = command(arguments, input, captured, capacity, false);
+    const char *scan[]={"/usr/bin/du","--all","--null","--block-size=1","--one-file-system","--",argv[2],NULL};
+    int result = command(!strcmp(argv[3],"scan") ? scan : arguments, input, captured, capacity, false);
     if (!strcmp(argv[3], "sequence") && !result) {
         set_stage("Second command");
         result = command(arguments, input, captured, capacity, false);
@@ -361,6 +362,22 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(result.stderr,b"")
         self.assertEqual(log.read_bytes().count(b"RAW_SCREEN_ERASE"),2)
         self.assertEqual(log.read_bytes().count(b"RAW_PACKAGE_DIAGNOSTIC"),2)
+
+    def test_directory_measurement_reports_counts_and_preserves_du_total(self):
+        root=self.base/'scan tree';root.mkdir()
+        for index in range(100):
+            (root/(f'private-name-{index}-'+('x'*100)+'\nwith\ttabs')).write_bytes(b'data'*1024)
+        os.link(next(root.iterdir()),root/'hardlink')
+        (root/'symlink').symlink_to('/does-not-exist')
+        expected=int(subprocess.check_output(['/usr/bin/du','-sx','--block-size=1',str(root)]).split(b'\t')[0])
+        args,log,captured=self.arguments('scan',64)
+        args[2]=str(root)
+        result=subprocess.run(args,input=b'',capture_output=True,timeout=10,
+                              env={**os.environ,'CENERE_RUNNER_GUI':'1'})
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertEqual(int(captured.read_text()),expected)
+        self.assertRegex(result.stdout,rb'Checked [1-9][0-9]* files and directories')
+        self.assertNotIn(b'private-name',result.stdout+log.read_bytes())
 
     def test_screen_transfer_progress_has_no_ambiguous_rsync_clock_and_preserves_failure_diagnostics(self):
         args,log,captured=self.arguments("progress_crlf",0,transfer=True)
